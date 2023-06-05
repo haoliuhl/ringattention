@@ -85,9 +85,9 @@ Explanation of the arguments:
 - `gpt.float32_logits`: whether to use float32 for logits. If `True` then compute logits in float32 to avoid numerical issues with bfloat16.
 
 
-For training large models on TPU or on GPU cluster with good inter connection, we recommend first using FSDP, and add tensor parallelism when the model is very large or the global batch size is too large. You can control parallelism by using mesh_dim.
+For large scale distributed training on TPU or on GPU cluster with good inter connection, we recommend first using FSDP, and add tensor parallelism when the model is very large or the global batch size is too large. You can control parallelism by using mesh_dim.
 
-This cobe uses autodiff and rematerialization, for achieving optimal speed up, we should write a backward pass in low level kernels such as Triton/CUDA etc. This is on our TODO list and PRs are welcome.
+This code uses autodiff and rematerialization. In order to achieve optimal performance especially for achieving speed up, the backward pass should be written in low level kernels such as Triton/CUDA etc. This is on our TODO list and PRs are welcome.
 
 
 ## Reference
