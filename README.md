@@ -92,7 +92,7 @@ This code uses autodiff and rematerialization. In order to achieve optimal perfo
 
 ## Reference
 If you find our work relevant to your research, please cite:
-```
+```bibtex
 @article{liu2023blockwise,
     title={Blockwise Parallel Transformer for Long Context Large Models},
     author={Hao Liu and Pieter Abbeel},
