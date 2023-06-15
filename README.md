@@ -27,7 +27,7 @@ The code is organized as follows:
 - `bpt/tools/` contains utility functions for training, logging, profiling, etc.
 
 ## Usage
-An example script for training a 3B Transformers with 65536 context window length on 1 A100 80GB using blockwise parallel transformer is as follows:
+An example script for training a 3B Transformers with 65536 context window length on 1 A100 80GB using blockwise parallel transformer is as follows. Firstly generate the training data (e.g OpenWebText) using `bpt/tools/prepare_owt.py`. Then run the following script:
 ```bash
 #! /bin/bash
 
