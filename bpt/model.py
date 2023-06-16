@@ -45,8 +45,8 @@ from bpt.tools.jax_utils import (
     with_sharding_constraint, get_jax_mesh, get_gradient_checkpoint_policy
 )
 from bpt.blocks.memeff import AttentionBlock as MemEffAttentionBlock
-from bpt.blocks.blockwise_parallel_v1 import AttentionBlock as BPAttentionBlock_v1
-from bpt.blocks.blockwise_parallel import AttentionBlock as BPAttentionBlock, Blockwise_LM_Head
+from bpt.blocks.blockwise_parallel_v1 import AttentionBlock as BlockwiseParallelBlock_v1
+from bpt.blocks.blockwise_parallel import AttentionBlock as BlockwiseParallelBlock, Blockwise_LM_Head
 from bpt.blocks.vanilla import AttentionBlock as VanillaAttentionBlock
 
 
@@ -526,9 +526,9 @@ class FlaxGPTBlock(nn.Module):
             # default memory efficient transformer (Rabe et al and Dao et al).
             'memeff': MemEffAttentionBlock,
             # default blockwise parallel transformer (Liu et al).
-            'blockwise_parallel': BPAttentionBlock,
+            'blockwise_parallel': BlockwiseParallelBlock,
             # less cleaner blockwise parallel transformer used in the paper.
-            'blockwise_parallel_v1': BPAttentionBlock_v1,
+            'blockwise_parallel_v1': BlockwiseParallelBlock_v1,
         }
 
         if self.config.attn_type in attention_blocks:
