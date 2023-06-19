@@ -21,10 +21,20 @@ sh tpu_requirements.sh
 The code is organized as follows:
 - `bpt/` contains the implementation of the BPT model.
 - `bpt/blocks/` contains the implementation of the vanilla transformer, memory efficient transformer, and blockwise parallel transformer.
+- `bpt/blocks/vanilla.py`: original vanilla transformer.
+- `bpt/blocks/mem_efficient.py` memory efficient transformer / flashattention.
+- `bpt/blocks/blockwise_parallel.py` our blockwise parallel transformer. This is the main implementation of the BPT model.
 - `data.py` contains the implementation of the data loader.
 - `train.py` contains the training loop.
 - `model.py` contains the model implementation.
-- `bpt/tools/` contains utility functions for training, logging, profiling, etc.
+- `bpt/tools/` contains utility functions for training, logging, profiling, data preparation, etc.
+
+The code in `bpt/blocks/blockwise_parallel.py` is optimized for simplicity and readability.
+A more optimized version in `bpt/blocks/blockwise_parallel_v1.py` is also provided, which explicitly instruct compiler to fuse certain ops and is ideal for porting to low-level kernels.
+
+In our tests, the performance of `blockwise_parallel_v1` is slightly better than `blockwise_parallel`, but the difference is not significant. Because with blockwise parallel transformer, the compiler is able to fuse blockwise FFN and blockwise attention automatically.
+
+We recommend using `blockwise_parallel` for simplicity. But if you want to port the code to low-level kernels, you can use `blockwise_parallel_v1` as a reference.
 
 ## Usage
 An example script for training a 3B Transformers with 65536 context window length on 1 A100 80GB using blockwise parallel transformer is as follows. Firstly generate the training data (e.g OpenWebText) using `bpt/tools/prepare_owt.py`. Then run the following script:
