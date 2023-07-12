@@ -178,8 +178,8 @@ class _AttentionBlock(nn.Module):
 
 
 class AttentionBlock(nn.Module):
-    q_chunk_size: int # not used
-    k_chunk_size: int # not used
+    q_chunk_size: int
+    k_chunk_size: int
     hidden_size: int
     num_heads: int
     rotary_dim: Optional[int]
@@ -191,8 +191,8 @@ class AttentionBlock(nn.Module):
     max_position_embeddings: int = 1024
     dtype: jnp.dtype = jnp.float32
     causal: bool = True
-    policy: str = None # not used
-    prevent_cse: bool = False # not used
+    policy: str = None
+    prevent_cse: bool = False
     float32_logits: bool = False
 
     def setup(self):
@@ -252,11 +252,7 @@ class AttentionBlock(nn.Module):
         init_cache: bool = False,
     ):
 
-        query, key, value = self.attn.forward_qkv(
-            hidden_states,
-            position_ids,
-            deterministic=deterministic,
-        )
+        query, key, value = self.attn.forward_qkv(hidden_states, position_ids, deterministic)
 
         query_length, key_length = query.shape[1], key.shape[1]
         if self.has_variable("cache", "cached_key"):
@@ -306,39 +302,4 @@ class AttentionBlock(nn.Module):
         ffn_output = self.attn.forward_ffn(hidden_states + attn_output, deterministic=deterministic)
         outputs = attn_output + ffn_output + hidden_states
         return outputs
-
-
-if __name__ == '__main__':
-    with jax.profiler.trace('/tmp/prof/vanilla'):
-        class Model(nn.Module):
-            def setup(self):
-                self.blocks = [
-                    AttentionBlock(
-                        q_chunk_size=256,
-                        k_chunk_size=256,
-                        hidden_size=2048,
-                        num_heads=16,
-                        rotary_dim=128,
-                        intermediate_size=8192,
-                        layer_norm_epsilon=1e-5,
-                        activation_function="gelu",
-                        resid_pdrop=0.0,
-                        max_position_embeddings=2048,
-                        dtype=jnp.float32,
-                        causal=True,
-                )
-                for _ in range(2)
-                ]
-            def __call__(self, hidden_states, attention_mask, position_ids):
-                for block in self.blocks:
-                    hidden_states = block(hidden_states, attention_mask, position_ids)
-                return hidden_states
-
-        hidden_states = jnp.zeros((2, 1024, 2048))
-        attention_mask = jnp.zeros((2, 1024), dtype=jnp.int32)
-        position_ids = jnp.zeros((2, 1024), dtype=jnp.int32)
-        model = Model()
-        variables = model.init(jax.random.PRNGKey(0), hidden_states, attention_mask, position_ids)
-        output = model.apply(variables, hidden_states, attention_mask, position_ids)
-        output = output.block_until_ready()
 

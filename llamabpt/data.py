@@ -15,6 +15,38 @@ import numpy as np
 from datasets import load_dataset
 
 
+class DatasetFactory(object):
+    """ Datset builder class. """
+
+    @staticmethod
+    def get_default_config(updates=None):
+        config = ConfigDict()
+        config.type = 'huggingface'
+        config.text_processor = TextProcessor.get_default_config()
+        config.huggingface_dataset = HuggingfaceDataset.get_default_config()
+        config.json_dataset = JsonDataset.get_default_config()
+
+        if updates is not None:
+            config.update(ConfigDict(updates).copy_and_resolve_references())
+        return config
+
+    @classmethod
+    def load_dataset(cls, config, tokenizer, **kwargs):
+        config = cls.get_default_config(config)
+        text_processor = TextProcessor(config.text_processor, tokenizer)
+        if config.type == 'huggingface':
+            return HuggingfaceDataset(
+                config.huggingface_dataset, tokenizer, text_processor, **kwargs
+            )
+        elif config.type == 'json':
+            return JsonDataset(config.json_dataset, tokenizer, text_processor, **kwargs)
+        else:
+            raise ValueError(f'Unknown dataset type: {config.type}')
+
+    def __init__(self):
+        raise ValueError('DatasetFactory is a static class and should not be instantiated.')
+
+
 class TextProcessor(object):
     """ Example processor that converts a dictionary of texts into tokens. """
 
@@ -87,7 +119,102 @@ class TextProcessor(object):
         return token_buffer, loss_mask_buffer, *aux
 
 
-class Dataset(object):
+class HuggingfaceDataset(object):
+    """ Huggingface dataset, where the dataset is loaded using the huggingface
+        datasets.load_dataset() function.
+    """
+
+    @staticmethod
+    def get_default_config(updates=None):
+        config = ConfigDict()
+        config.path = 'c4'
+        config.name = 'en'
+        config.split = 'train'
+        config.streaming = False
+        config.seq_length = 1024
+        config.batch_size = 8
+        config.always_start_with_bos = False
+
+        if updates is not None:
+            config.update(ConfigDict(updates).copy_and_resolve_references())
+        return config
+
+    def __init__(self, config, tokenizer, text_processor):
+        self.config = self.get_default_config(config)
+        name = self.config.name if self.config.name != '' else None
+        split = self.config.split if self.config.split != '' else None
+        self._tokenizer = tokenizer
+        self._text_processor = text_processor
+        self._dataset = load_dataset(
+            self.config.path, name, split=split, streaming=self.config.streaming
+        )
+
+    def __iter__(self):
+        chunk_size = self.config.batch_size * self.config.seq_length
+        total_tokens = 0
+        while True:
+            token_buffer = []
+            loss_mask_buffer = []
+            for index, example in enumerate(self._dataset):
+                tokens, loss_masks = self.text_processor(example)
+                token_buffer.extend(tokens)
+                loss_mask_buffer.extend(loss_masks)
+                while len(token_buffer) > chunk_size + 1:
+                    total_tokens += chunk_size
+                    metrics = {
+                        'dataset_example_index': index,
+                        'dataset_total_tokens': total_tokens,
+                    }
+                    batch = {
+                        'input_tokens': np.array(token_buffer[:chunk_size], dtype=np.int32).reshape(
+                            self.config.batch_size, -1
+                        ),
+                        'target_tokens': np.array(token_buffer[1:chunk_size + 1], dtype=np.int32).reshape(
+                            self.config.batch_size, -1
+                        ),
+                        'loss_masks': np.array(loss_mask_buffer[1:chunk_size + 1], dtype=np.float32).reshape(
+                            self.config.batch_size, -1
+                        ),
+                    }
+                    if self.config.always_start_with_bos:
+                        batch['input_tokens'][:, 0] = self.tokenizer.bos_token_id
+                    yield batch, metrics
+                    token_buffer = token_buffer[chunk_size:]
+                    loss_mask_buffer = loss_mask_buffer[chunk_size:]
+
+    def get_state_dict(self):
+        return dict(config=self.config)
+
+    def load_state_dict(self, state_dict):
+        if 'config' in state_dict:
+            self.config.update(ConfigDict(state_dict['config']))
+
+    @property
+    def seq_length(self):
+        return self.config.seq_length
+
+    @property
+    def tokenizer(self):
+        return self._tokenizer
+
+    @property
+    def text_processor(self):
+        return self._text_processor
+
+    @property
+    def dataset(self):
+        return self._dataset
+
+    @property
+    def vocab_size(self):
+        return len(self._tokenizer)
+
+
+class JsonDataset(object):
+    """ JSON dataset, where each line of the data file contains a JSON
+        dictionary with text fields.
+    """
+
     @staticmethod
     def get_default_config(updates=None):
         config = ConfigDict()

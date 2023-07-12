@@ -12,7 +12,7 @@ from jax.experimental.pjit import pjit
 from jax.sharding import PartitionSpec as PS
 from flax.training.train_state import TrainState
 
-from bpt.data import Dataset, TextProcessor
+from llamabpt.data import DatasetFactory
 from tux import (
     JaxRNG, JaxDistributedConfig, next_rng, match_partition_rules,
     cross_entropy_loss_and_accuracy, global_norm, get_float_dtype_by_name,
@@ -20,42 +20,36 @@ from tux import (
     make_shard_and_gather_fns, with_sharding_constraint, define_flags_with_default,
     OptimizerFactory, StreamingCheckpointer
 )
-from bpt.model import GPTConfig, FlaxGPTForCausalLMModule
-from bpt.blocks.blockwise_parallel import blockwise_cross_entropy
+from llamabpt.llamabpt import LLaMAConfig, FlaxLLaMAForCausalLMModule, blockwise_cross_entropy
 
 
 FLAGS, FLAGS_DEF = define_flags_with_default(
     seed=42,
-    initialize_jax_distributed=False,
     mesh_dim='1,-1,1',
     dtype='bf16',
     total_steps=10000,
-    load_gpt_config='',
-    update_gpt_config='',
+    load_llama_config='',
+    update_llama_config='',
     load_checkpoint='',
     load_dataset_state='',
     log_freq=50,
     save_model_freq=0,
     save_milestone_freq=0,
     eval_steps=0,
-    tokenizer=GPTConfig.get_tokenizer_config(),
-    text_processor=TextProcessor.get_default_config(),
-    train_dataset=Dataset.get_default_config(),
-    eval_dataset=Dataset.get_default_config(),
+    tokenizer=LLaMAConfig.get_tokenizer_config(),
+    train_dataset=DatasetFactory.get_default_config(),
+    eval_dataset=DatasetFactory.get_default_config(),
     optimizer=OptimizerFactory.get_default_config(),
     checkpointer=StreamingCheckpointer.get_default_config(),
-    gpt=GPTConfig.get_default_config(),
+    llama=LLaMAConfig.get_default_config(),
     logger=tux.WandBLogger.get_default_config(),
     log_all_worker=False,
-    profile_steps=0,
-    stop_after_profile=True,
+    jax_distributed=JaxDistributedConfig.get_default_config(),
 )
 
 
 def main(argv):
-    if FLAGS.initialize_jax_distributed:
-        jax.distributed.initialize()
-
+    JaxDistributedConfig.initialize(FLAGS.jax_distributed)
     variant = tux.get_user_flags(FLAGS, FLAGS_DEF)
     flags_config_dict = tux.user_flags_to_config_dict(FLAGS, FLAGS_DEF)
     logger = tux.WandBLogger(
@@ -65,53 +59,54 @@ def main(argv):
     )
     set_random_seed(FLAGS.seed)
 
+    tokenizer = LLaMAConfig.get_tokenizer(FLAGS.tokenizer)
+    dataset = DatasetFactory.load_dataset(FLAGS.train_dataset, tokenizer)
     if FLAGS.load_dataset_state != '':
-        dataset = tux.load_pickle(FLAGS.load_dataset_state)
-    else:
-        tokenizer = GPTConfig.get_tokenizer(FLAGS.tokenizer)
-        text_processor = TextProcessor(FLAGS.text_processor, tokenizer)
-        dataset = Dataset(FLAGS.train_dataset, tokenizer, text_processor)
+        dataset.load_state_dict(tux.load_pickle(FLAGS.load_dataset_state))
 
     if FLAGS.eval_steps > 0:
-        eval_dataset = Dataset(
-            FLAGS.eval_dataset, dataset.tokenizer, dataset.text_processor,
+        eval_dataset = DatasetFactory.load_dataset(
+            FLAGS.eval_dataset, dataset.tokenizer
         )
-        eval_iterator = iter(eval_dataset.val_iter())
+        eval_iterator = iter(eval_dataset)
 
     seq_length = dataset.seq_length
 
-    if FLAGS.load_gpt_config != '':
-        gpt_config = GPTConfig.load_config(FLAGS.load_gpt_config)
-        update_gpt_config = GPTConfig(**FLAGS.gpt)
-        gpt_config.update(dict(
-            q_chunk_size=update_gpt_config.q_chunk_size,
-            k_chunk_size=update_gpt_config.k_chunk_size,
-            attn_type=update_gpt_config.attn_type,
-            n_positions=update_gpt_config.n_positions,
-            gradient_checkpointing=update_gpt_config.gradient_checkpointing,
-            scan_layers=update_gpt_config.scan_layers,
-            param_scan_axis=update_gpt_config.param_scan_axis,
-            float32_logits=update_gpt_config.float32_logits,
+    if FLAGS.load_llama_config != '':
+        llama_config = LLaMAConfig.load_config(FLAGS.load_llama_config)
+        updates = LLaMAConfig(**FLAGS.llama)
+        llama_config.update(dict(
+            q_chunk_size=updates.q_chunk_size,
+            k_chunk_size=updates.k_chunk_size,
+            ffn_chunk_size=updates.ffn_chunk_size,
+            head_chunk_size=updates.head_chunk_size,
+            loss_chunk_size=updates.loss_chunk_size,
+            max_sequence_length=updates.max_sequence_length,
+            remat_policy=updates.remat_policy,
+            scan_layers=updates.scan_layers,
+            param_scan_axis=updates.param_scan_axis,
+            float32_logits=updates.float32_logits,
         ))
     else:
-        gpt_config = GPTConfig(**FLAGS.gpt)
+        llama_config = LLaMAConfig(**FLAGS.llama)
 
-    if FLAGS.update_gpt_config != '':
-        gpt_config.update(dict(eval(FLAGS.update_gpt_config)))
+    if FLAGS.update_llama_config != '':
+        llama_config.update(dict(eval(FLAGS.update_llama_config)))
 
-    gpt_config.update(dict(
+    llama_config.update(dict(
         bos_token_id=dataset.tokenizer.bos_token_id,
         eos_token_id=dataset.tokenizer.eos_token_id,
     ))
-    if gpt_config.vocab_size < dataset.vocab_size:
-        gpt_config.update(dict(vocab_size=dataset.vocab_size))
+    if llama_config.vocab_size < dataset.vocab_size:
+        llama_config.update(dict(vocab_size=dataset.vocab_size))
 
-    model = FlaxGPTForCausalLMModule(gpt_config, dtype=get_float_dtype_by_name(FLAGS.dtype)
+    model = FlaxLLaMAForCausalLMModule(
+        llama_config, dtype=get_float_dtype_by_name(FLAGS.dtype)
     )
 
     optimizer, optimizer_info = OptimizerFactory.get_optimizer(
         FLAGS.optimizer,
-        get_weight_decay_mask(GPTConfig.get_weight_decay_exclusions()),
+        get_weight_decay_mask(LLaMAConfig.get_weight_decay_exclusions())
     )
 
     def create_trainstate_from_params(params):
@@ -123,32 +118,30 @@ def main(argv):
             input_ids=jnp.zeros((4, seq_length), dtype=jnp.int32),
             position_ids=jnp.zeros((4, seq_length), dtype=jnp.int32),
             attention_mask=jnp.ones((4, seq_length), dtype=jnp.int32),
-            rngs=rng_generator(gpt_config.rng_keys()),
+            rngs=rng_generator(llama_config.rng_keys()),
         )
         return TrainState.create(params=params, tx=optimizer, apply_fn=None)
 
-    if FLAGS.gpt.attn_type == 'blockwise_parallel' or FLAGS.gpt.attn_type == 'blockwise_parallel_v1':
-        loss_func = partial(blockwise_cross_entropy,
-                                                     policy=FLAGS.gpt.gradient_checkpointing,
-                                                     chunk_size=FLAGS.gpt.q_chunk_size,
-                                                     prevent_cse=not FLAGS.gpt.scan_layers,)
+    if FLAGS.llama.loss_chunk_size <= 0:
+        cross_entropy_func = cross_entropy_loss_and_accuracy
     else:
-        loss_func = cross_entropy_loss_and_accuracy
-
+        cross_entropy_func = partial(
+            blockwise_cross_entropy,
+            policy=FLAGS.llama.remat_policy,
+            chunk_size=FLAGS.llama.loss_chunk_size,
+            prevent_cse=not FLAGS.llama.scan_layers,
+        )
     def train_step(train_state, rng, batch):
         rng_generator = JaxRNG(rng)
-        input_tokens = with_sharding_constraint(batch['input_tokens'], PS(('dp', 'fsdp')))
-        target_tokens = with_sharding_constraint(batch['target_tokens'], PS(('dp', 'fsdp')))
-        loss_masks = with_sharding_constraint(batch['loss_masks'], PS(('dp', 'fsdp')))
+        batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
         def loss_and_accuracy(params):
             logits = model.apply(
-                params,
-                input_tokens,
-                deterministic=False,
-                rngs=rng_generator(gpt_config.rng_keys()),
+                params, batch['input_tokens'], deterministic=False,
+                rngs=rng_generator(llama_config.rng_keys()),
             ).logits
-            return loss_func(logits, target_tokens, loss_masks)
-
+            return cross_entropy_func(
+                logits, batch['target_tokens'], batch['loss_masks']
+            )
         grad_fn = jax.value_and_grad(loss_and_accuracy, has_aux=True)
         (loss, accuracy), grads = grad_fn(train_state.params)
         train_state = train_state.apply_gradients(grads=grads)
@@ -163,32 +156,24 @@ def main(argv):
 
     def eval_step(train_state, rng, batch):
         rng_generator = JaxRNG(rng)
-        input_tokens = with_sharding_constraint(batch['input_tokens'], PS(('dp', 'fsdp')))
-        target_tokens = with_sharding_constraint(batch['target_tokens'], PS(('dp', 'fsdp')))
-        loss_masks = with_sharding_constraint(batch['loss_masks'], PS(('dp', 'fsdp')))
+        batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
         logits = model.apply(
-            train_state.params,
-            input_tokens,
-            deterministic=True,
-            rngs=rng_generator(gpt_config.rng_keys()),
+            train_state.params, batch['input_tokens'], deterministic=True,
+            rngs=rng_generator(llama_config.rng_keys()),
         ).logits
-        loss, accuracy = loss_func(logits, target_tokens, loss_masks)
+        loss, accuracy = cross_entropy_func(
+            logits, batch['target_tokens'], batch['loss_masks']
+        )
         metrics = dict(
-            loss=loss,
-            accuracy=accuracy,
+            eval_loss=loss,
+            eval_accuracy=accuracy,
         )
         return rng_generator(), metrics
 
     train_state_shapes = jax.eval_shape(init_fn, next_rng())
     train_state_partition = match_partition_rules(
-        GPTConfig.get_partition_rules(FLAGS.gpt.scan_layers), train_state_shapes
+        LLaMAConfig.get_partition_rules(FLAGS.llama.scan_layers, FLAGS.llama.param_scan_axis), train_state_shapes
     )
-
-    num_params = sum(x.size for x in jax.tree_leaves(train_state_shapes.params))
-    num_nonembed_params = num_params - gpt_config.vocab_size * gpt_config.n_embd
-    param_stats = {"num_params": num_params,"num_nonembed_params": num_nonembed_params}
-    logger.log(param_stats)
-    tqdm.write("\n" + pprint.pformat(param_stats) + "\n")
 
     shard_fns, gather_fns = make_shard_and_gather_fns(
         train_state_partition, train_state_shapes
@@ -231,7 +216,7 @@ def main(argv):
             step=step,
             variant=variant,
             flags=flags_config_dict,
-            gpt_config=gpt_config.to_dict(),
+            llama_config=llama_config.to_dict(),
         )
         checkpointer.save_all(
             train_state=train_state,
@@ -241,39 +226,7 @@ def main(argv):
             milestone=milestone,
         )
 
-    if FLAGS.profile_steps > 0:
-        import os
-        os.makedirs(logger.profile_dir, exist_ok=True)
-        mesh = GPTConfig.get_jax_mesh(FLAGS.mesh_dim)
-        with mesh:
-            train_state, restored_params = None, None
-            if train_state is None and restored_params is None:
-                # Initialize from scratch
-                train_state = sharded_init_fn(next_rng())
-            elif train_state is None and restored_params is not None:
-                # Restore from params but initialize train_state
-                train_state = sharded_create_trainstate_from_params(restored_params)
-                del restored_params
-            sharded_rng = next_rng()
-            # warmup
-            for batch, dataset_metrics in dataset:
-                train_state, sharded_rng, metrics = sharded_train_step(
-                    train_state, sharded_rng, batch
-                )
-                break
-            # profile
-            jax.profiler.start_trace(logger.profile_dir)
-            for step, (batch, dataset_metrics) in zip(trange(FLAGS.profile_steps), dataset):
-                train_state, sharded_rng, metrics = sharded_train_step(
-                    train_state, sharded_rng, batch
-                )
-                jax.block_until_ready(train_state)
-                jax.profiler.save_device_memory_profile(f'{logger.profile_dir}/memory{step}.prof')
-            jax.profiler.stop_trace()
-        if FLAGS.stop_after_profile:
-            exit()
-
-    mesh = GPTConfig.get_jax_mesh(FLAGS.mesh_dim)
+    mesh = LLaMAConfig.get_jax_mesh(FLAGS.mesh_dim)
     with mesh:
         train_state, restored_params = None, None
         if FLAGS.load_checkpoint != '':

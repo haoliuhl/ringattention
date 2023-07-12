@@ -1,18 +1,3 @@
-# coding=utf-8
-# Copyright 2021 The EleutherAI and The HuggingFace Inc. team.
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-
 from functools import partial
 from typing import Optional, Tuple
 import json
@@ -35,15 +20,12 @@ from transformers.modeling_flax_utils import ACT2FN, FlaxPreTrainedModel, append
 from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging
 from transformers.generation.flax_logits_process import FlaxLogitsProcessorList
 from transformers import AutoTokenizer
-from jax.sharding import PartitionSpec as PS
+from jax.sharding import PartitionSpec
 
 from ml_collections import ConfigDict
 from ml_collections.config_dict import config_dict
-from bpt.tools.utils import function_args_to_config, load_pickle, open_file
+from tux import function_args_to_config, load_pickle, open_file, get_jax_mesh, get_gradient_checkpoint_policy
 
-from bpt.tools.jax_utils import (
-    with_sharding_constraint, get_jax_mesh, get_gradient_checkpoint_policy
-)
 from bpt.blocks.memeff import AttentionBlock as MemEffAttentionBlock
 from bpt.blocks.blockwise_parallel_v1 import AttentionBlock as BlockwiseParallelBlock_v1
 from bpt.blocks.blockwise_parallel import AttentionBlock as BlockwiseParallelBlock, Blockwise_LM_Head
@@ -173,7 +155,7 @@ GPT_STANDARD_CONFIGS = {
 
 class GPTConfig(PretrainedConfig):
     r"""
-    This is the configuration class to store the configuration of a [`GPTModel`]. It is used to instantiate a GPT-J
+    This is the configuration class to store the configuration of a [`GPTJModel`]. It is used to instantiate a GPT-J
     model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
     defaults will yield a similar configuration to that of the GPT-J
     [EleutherAI/gpt-j-6B](https://huggingface.co/EleutherAI/gpt-j-6B) architecture. Configuration objects inherit from
@@ -182,7 +164,7 @@ class GPTConfig(PretrainedConfig):
     Args:
         vocab_size (`int`, *optional*, defaults to 50432):
             Vocabulary size of the GPT-J model. Defines the number of different tokens that can be represented by the
-            `inputs_ids` passed when calling [`GPTModel`].
+            `inputs_ids` passed when calling [`GPTJModel`].
         n_positions (`int`, *optional*, defaults to 2048):
             The maximum sequence length that this model might ever be used with. Typically set this to something large
             just in case (e.g., 512 or 1024 or 2048).
@@ -214,11 +196,11 @@ class GPTConfig(PretrainedConfig):
             Whether or not the model should return the last key/values attentions (not used by all models).
     Example:
     ```python
-    >>> from transformers import GPTModel, GPTConfig
+    >>> from transformers import GPTJModel, GPTJConfig
     >>> # Initializing a GPT-J 6B configuration
-    >>> configuration = GPTConfig()
+    >>> configuration = GPTJConfig()
     >>> # Initializing a model from the configuration
-    >>> model = GPTModel(configuration)
+    >>> model = GPTJModel(configuration)
     >>> # Accessing the model configuration
     >>> configuration = model.config
     ```"""
@@ -325,37 +307,37 @@ class GPTConfig(PretrainedConfig):
         """
         if scan_layers:
             return (
-                ('transformer/wte/embedding', PS('mp', 'fsdp')),
-                ('attn/(k_proj|q_proj|v_proj)/kernel', PS(None, 'fsdp', 'mp')),
-                ('attn/out_proj/kernel', PS(None, 'mp', 'fsdp')),
-                ('attn/fc_in/kernel', PS(None, 'fsdp', 'mp')),
-                ('attn/fc_in/bias', PS(None, 'mp')),
-                ('attn/fc_out/kernel', PS(None, 'mp', 'fsdp')),
-                ('attn/fc_out/bias', PS(None, None)),
-                ('ln_[0-9]+/bias', PS(None, None)),
-                ('[0-9]+/ln_[0-9]+/scale', PS(None, None)),
-                ('ln_f/bias', PS(None)),
-                ('ln_f/scale', PS(None)),
-                ('lm_head/kernel', PS('fsdp', 'mp')),
-                ('lm_head/bias', PS('mp')),
-                ('.*', PS(None)),
+                ('transformer/wte/embedding', PartitionSpec('mp', 'fsdp')),
+                ('attn/(k_proj|q_proj|v_proj)/kernel', PartitionSpec(None, 'fsdp', 'mp')),
+                ('attn/out_proj/kernel', PartitionSpec(None, 'mp', 'fsdp')),
+                ('attn/fc_in/kernel', PartitionSpec(None, 'fsdp', 'mp')),
+                ('attn/fc_in/bias', PartitionSpec(None, 'mp')),
+                ('attn/fc_out/kernel', PartitionSpec(None, 'mp', 'fsdp')),
+                ('attn/fc_out/bias', PartitionSpec(None, None)),
+                ('ln_[0-9]+/bias', PartitionSpec(None, None)),
+                ('[0-9]+/ln_[0-9]+/scale', PartitionSpec(None, None)),
+                ('ln_f/bias', PartitionSpec(None)),
+                ('ln_f/scale', PartitionSpec(None)),
+                ('lm_head/kernel', PartitionSpec('fsdp', 'mp')),
+                ('lm_head/bias', PartitionSpec('mp')),
+                ('.*', PartitionSpec(None)),
             )
         else:
             return (
-                ('transformer/wte/embedding', PS('mp', 'fsdp')),
-                ('attn/(k_proj|q_proj|v_proj)/kernel', PS('fsdp', 'mp')),
-                ('attn/out_proj/kernel', PS('mp', 'fsdp')),
-                ('attn/fc_in/kernel', PS('fsdp', 'mp')),
-                ('attn/fc_in/bias', PS('mp')),
-                ('attn/fc_out/kernel', PS('mp', 'fsdp')),
-                ('attn/fc_out/bias', PS(None)),
-                ('ln_[0-9]+/bias', PS(None)),
-                ('[0-9]+/ln_[0-9]+/scale', PS(None)),
-                ('ln_f/bias', PS(None)),
-                ('ln_f/scale', PS(None)),
-                ('lm_head/kernel', PS('fsdp', 'mp')),
-                ('lm_head/bias', PS('mp')),
-                ('.*', PS(None)),
+                ('transformer/wte/embedding', PartitionSpec('mp', 'fsdp')),
+                ('attn/(k_proj|q_proj|v_proj)/kernel', PartitionSpec('fsdp', 'mp')),
+                ('attn/out_proj/kernel', PartitionSpec('mp', 'fsdp')),
+                ('attn/fc_in/kernel', PartitionSpec('fsdp', 'mp')),
+                ('attn/fc_in/bias', PartitionSpec('mp')),
+                ('attn/fc_out/kernel', PartitionSpec('mp', 'fsdp')),
+                ('attn/fc_out/bias', PartitionSpec(None)),
+                ('ln_[0-9]+/bias', PartitionSpec(None)),
+                ('[0-9]+/ln_[0-9]+/scale', PartitionSpec(None)),
+                ('ln_f/bias', PartitionSpec(None)),
+                ('ln_f/scale', PartitionSpec(None)),
+                ('lm_head/kernel', PartitionSpec('fsdp', 'mp')),
+                ('lm_head/bias', PartitionSpec('mp')),
+                ('.*', PartitionSpec(None)),
             )
 
     @staticmethod
@@ -573,7 +555,7 @@ class FlaxGPTBlock(nn.Module):
             init_cache=init_cache,
         )
         attn_weights = None
-        if self.config.scan_layers: # NOTE: this is a hack to work with scan_layers
+        if self.config.scan_layers:
             outputs = attn_outputs, None
         else:
             outputs = (attn_outputs, attn_weights) if output_attentions else (attn_outputs,)
@@ -850,7 +832,10 @@ class FlaxGPTModule(nn.Module):
         )
         self.dropout = nn.Dropout(rate=self.config.embd_pdrop)
         self.h = FlaxGPTBlockCollection(self.config, dtype=self.dtype)
-        self.ln_f = nn.LayerNorm(epsilon=self.config.layer_norm_epsilon, dtype=self.dtype)
+        self.ln_f = nn.LayerNorm(
+            epsilon=self.config.layer_norm_epsilon,
+            dtype=jnp.promote_types(self.dtype, jnp.float32)
+        )
 
     def __call__(
         self,

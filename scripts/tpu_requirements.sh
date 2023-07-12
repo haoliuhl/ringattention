@@ -11,42 +11,36 @@ sudo apt-get update && sudo apt-get install -y \
     p7zip-full \
     nfs-common
 
+# Update pip
+pip install --upgrade pip
 
 # Python dependencies
 cat > $HOME/tpu_requirements.txt <<- EndOfFile
 -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-jax[tpu]==0.4.7
+jax[tpu]==0.4.11
 tensorflow==2.11.0
 tensorboard-plugin-profile
 flax==0.6.8
 optax==0.1.4
 chex==0.1.7
 distrax==0.1.3
+einops
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch==1.12.1
-transformers==4.27.2
-datasets==2.9.0
-huggingface_hub==0.13.3
+torch==2.0.0
+transformers==4.29.2
+datasets==2.13.0
 tqdm
 ml_collections
-wandb==0.14.2
-gcsfs==2022.11.0
+wandb
+gcsfs
 requests
 typing-extensions
-lm-eval==0.3.0
+lm-eval
 sentencepiece
-pydantic
-fastapi
-uvicorn
-gradio
-evaluate==0.3.0
-pyext==0.7
-einops
+tax==0.0.1
 EndOfFile
 
 pip install --upgrade -r $HOME/tpu_requirements.txt
-pip install --upgrade clu
-
 
 # vim configurations
 cat > $HOME/.vimrc <<- EndOfFile

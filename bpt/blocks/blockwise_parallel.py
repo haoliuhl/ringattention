@@ -256,7 +256,7 @@ class AttentionBlock(nn.Module):
         deterministic: bool = True,
         init_cache: bool = False,
     ):
-        query, key, value = self.attn.forward_qkv(hidden_states, position_ids)
+        query, key, value = self.attn.forward_qkv(hidden_states, position_ids, deterministic)
         query = query / jnp.sqrt(query.shape[-1])
 
         dropout_rng = None
@@ -274,7 +274,7 @@ class AttentionBlock(nn.Module):
         # During fast autoregressive decoding, we feed one position at a time,
         # and cache the keys and values step by step.
         if self.has_variable("cache", "cached_key") or init_cache:
-            query, key, value = self.attn.forward_qkv(hidden_states, position_ids)
+            query, key, value = self.attn.forward_qkv(hidden_states, position_ids, deterministic)
             key, value, attention_mask = self._concatenate_to_cache(key, value, query, attention_mask)
             # use standard dot product attention since query length is 1
             attn_weights = nn.dot_product_attention_weights(
@@ -360,18 +360,9 @@ class Carry(NamedTuple):
     denominator: jax.Array
     max_so_far: jax.Array
 
-def blockwise_compute_attn(query, key, value,
-        bias=None,
-        deterministic=False,
-        dropout_rng=None,
-        attn_pdrop=0.0,
-        causal_mask=True,
-        query_chunk_size=None,
-        key_chunk_size=None,
-        dtype=jnp.float32,
-        policy='nothing_saveable',
-        precision=lax.Precision.HIGHEST,
-        prevent_cse=False,):
+def blockwise_compute_attn(query, key, value, bias, deterministic,
+        dropout_rng, attn_pdrop, causal_mask, query_chunk_size,
+        key_chunk_size, dtype, policy, precision, prevent_cse):
     q_len = query.shape[1]
     kv_len = key.shape[1]
     query = rearrange(query, 'b (n c) h q -> b n c h q', c=query_chunk_size)
@@ -419,9 +410,9 @@ def blockwise_compute_attn(query, key, value,
             return Carry(numerator, denominator, max_score), None
 
         init_carry = Carry(
-            jnp.zeros((batch, query_chunk_size, num_heads, dim_per_head), dtype=dtype),
-            jnp.zeros((batch, query_chunk_size, num_heads, dim_per_head), dtype=dtype),
-            (-jnp.inf) * jnp.ones((batch, query_chunk_size, num_heads, 1), dtype=dtype),
+            jnp.zeros((batch, query_chunk_size, num_heads, dim_per_head), dtype=query.dtype),
+            jnp.zeros((batch, query_chunk_size, num_heads, dim_per_head), dtype=query.dtype),
+            (-jnp.inf) * jnp.ones((batch, query_chunk_size, num_heads, 1), dtype=query.dtype),
         )
         (numerator, denominator, max_score), _ = lax.scan(
             summarize_chunk, init_carry, xs=(key, value, jnp.arange(0, num_kv))
@@ -552,37 +543,3 @@ def blockwise_cross_entropy(logits, tokens, valid=None,
     loss = - loss / num
     accuracy = accuracy / num
     return loss, accuracy
-
-if __name__ == '__main__':
-    with jax.profiler.trace('/tmp/prof/blockwise_parallel_simplified'):
-        class Model(nn.Module):
-            def setup(self):
-                self.blocks = [
-                    AttentionBlock(
-                        q_chunk_size=256,
-                        k_chunk_size=256,
-                        hidden_size=2048,
-                        num_heads=16,
-                        rotary_dim=128,
-                        intermediate_size=8192,
-                        layer_norm_epsilon=1e-5,
-                        activation_function="gelu",
-                        resid_pdrop=0.0,
-                        max_position_embeddings=2048,
-                        dtype=jnp.float32,
-                        causal=True,
-                )
-                for _ in range(2)
-                ]
-            def __call__(self, hidden_states, attention_mask, position_ids):
-                for block in self.blocks:
-                    hidden_states = block(hidden_states, attention_mask, position_ids)
-                return hidden_states
-
-        hidden_states = jnp.zeros((2, 1024, 2048))
-        attention_mask = jnp.zeros((2, 1024), dtype=jnp.int32)
-        position_ids = jnp.zeros((2, 1024), dtype=jnp.int32)
-        model = Model()
-        variables = model.init(jax.random.PRNGKey(0), hidden_states, attention_mask, position_ids)
-        output = model.apply(variables, hidden_states, attention_mask, position_ids)
-        output = output.block_until_ready()
