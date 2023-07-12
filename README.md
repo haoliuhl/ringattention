@@ -6,6 +6,10 @@ Paper: https://arxiv.org/abs/2305.19370
 
 This is the implementation of the Blockwise Parallel Transformer (BPT) model. The model is described in the paper [Blockwise Parallel Transformer for Long Context Large Models](https://arxiv.org/pdf/2305.19370.pdf).
 
+## Updates
+
+- 2021/10/20: Added the implementation of BPT on top of the LLaMA language model, the code is under `llamabpt/`. It has simpler code and supports BPT, memeff/flashattention, and vanilla computation. See [here](llamabpt/README.md) for more details.
+
 ## Requirements
 Install the requirements with:
 ```
