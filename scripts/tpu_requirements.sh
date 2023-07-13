@@ -17,7 +17,7 @@ pip install --upgrade pip
 # Python dependencies
 cat > $HOME/tpu_requirements.txt <<- EndOfFile
 -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-jax[tpu]==0.4.11
+jax[tpu]==0.4.7
 tensorflow==2.11.0
 tensorboard-plugin-profile
 flax==0.6.8
@@ -37,7 +37,7 @@ requests
 typing-extensions
 lm-eval
 sentencepiece
-tax==0.0.1
+tux==0.0.1
 EndOfFile
 
 pip install --upgrade -r $HOME/tpu_requirements.txt
