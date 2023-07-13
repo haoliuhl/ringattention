@@ -8,7 +8,7 @@ This is the implementation of the Blockwise Parallel Transformer (BPT) model. Th
 
 ## Updates
 
-- 2021/10/20: Added the implementation of BPT on top of the LLaMA language model, the code is under `llamabpt/`. It has simpler code and supports BPT, memeff/flashattention, and vanilla computation. See [here](llamabpt/README.md) for more details.
+- 2023/7/12: Added the implementation of BPT on top of the LLaMA language model, the code is under `llamabpt/`. It has simpler code and supports BPT, memeff/flashattention, and vanilla computation. See [here](llamabpt/README.md) for more details.
 
 ## Requirements
 Install the requirements with:
