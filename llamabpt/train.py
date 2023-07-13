@@ -4,6 +4,7 @@ from functools import partial
 from tqdm import tqdm, trange
 import numpy as np
 from absl.app import run
+import absl.logging as logging
 import tux
 
 import jax
@@ -45,6 +46,7 @@ FLAGS, FLAGS_DEF = define_flags_with_default(
     logger=tux.WandBLogger.get_default_config(),
     log_all_worker=False,
     jax_distributed=JaxDistributedConfig.get_default_config(),
+    autoresume=False,
 )
 
 
@@ -61,7 +63,12 @@ def main(argv):
 
     tokenizer = LLaMAConfig.get_tokenizer(FLAGS.tokenizer)
     dataset = DatasetFactory.load_dataset(FLAGS.train_dataset, tokenizer)
-    if FLAGS.load_dataset_state != '':
+    if FLAGS.autoresume:
+        if tux.check_exists(logger.output_dir):
+            logging.info('Found existing output. Resuming dataset from latest checkpoint...')
+            resume_path = f"{logger.output_dir}/dataset.pkl"
+            dataset.load_state_dict(tux.load_pickle(resume_path))
+    elif FLAGS.load_dataset_state != '':
         dataset.load_state_dict(tux.load_pickle(FLAGS.load_dataset_state))
 
     if FLAGS.eval_steps > 0:
@@ -229,7 +236,15 @@ def main(argv):
     mesh = LLaMAConfig.get_jax_mesh(FLAGS.mesh_dim)
     with mesh:
         train_state, restored_params = None, None
-        if FLAGS.load_checkpoint != '':
+
+        if FLAGS.autoresume:
+            if tux.check_exists(logger.output_dir):
+                logging.info('Found existing output. Resuming model from latest checkpoint...')
+                resume_path = f"trainstate::{logger.output_dir}/streaming_train_state"
+                train_state, restored_params = checkpointer.load_trainstate_checkpoint(
+                    resume_path, train_state_shapes, shard_fns
+                )
+        elif FLAGS.load_checkpoint != '':
             train_state, restored_params = checkpointer.load_trainstate_checkpoint(
                 FLAGS.load_checkpoint, train_state_shapes, shard_fns
             )
