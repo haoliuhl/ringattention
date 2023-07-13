@@ -33,4 +33,4 @@ dependencies:
         - gcsfs
         - requests
         - jupyter_http_over_ws
-        - tux==0.0.1
+        - tux==0.0.2

@@ -37,7 +37,7 @@ requests
 typing-extensions
 lm-eval
 sentencepiece
-tux==0.0.1
+tux==0.0.2
 EndOfFile
 
 pip install --upgrade -r $HOME/tpu_requirements.txt
