@@ -23,26 +23,17 @@ sh tpu_requirements.sh
 ## Code structure
 
 The code is organized as follows:
-- `bpt/` contains the implementation of the BPT model.
-- `bpt/blocks/` contains the implementation of the vanilla transformer, memory efficient transformer, and blockwise parallel transformer.
-- `bpt/blocks/vanilla.py`: original vanilla transformer.
-- `bpt/blocks/mem_efficient.py` memory efficient transformer / flashattention.
-- `bpt/blocks/blockwise_parallel.py` our blockwise parallel transformer. This is the main implementation of the BPT model.
-- `data.py` contains the implementation of the data loader.
-- `train.py` contains the training loop.
-- `model.py` contains the model implementation.
-- `prepare_data.py` contains utility functions for training, logging, profiling, data preparation, etc.
-- `scripts/` contains the requirements.
+- `scripts/` contains the requirements and scripts for preparing the data.
+- `bpt/` contains original implementation of the BPT model on top of the GPT architecture.
+- `llamabpt/` contains the implementation of BPT on top of the LLaMA language model.
 
-The code in `bpt/blocks/blockwise_parallel.py` is optimized for simplicity and readability.
-A more optimized version in `bpt/blocks/blockwise_parallel_v1.py` is also provided, which explicitly instruct compiler to fuse certain ops and is ideal for porting to low-level kernels.
+We recommend using the implementation in `llamabpt/`. The implementation in `llamabpt/` is simpler and has better optimized sharding annotations for distributed FSDP training. It also supports BPT, memeff/flashattention, and vanilla computation.
+See [here](llamabpt/README.md) for more details.
 
-In our tests, the performance of `blockwise_parallel_v1` is slightly better than `blockwise_parallel`, but the difference is not significant. Because with blockwise parallel transformer, the compiler is able to fuse blockwise FFN and blockwise attention automatically.
-
-We recommend using `blockwise_parallel` for simplicity. But if you want to port the code to low-level kernels, you can use `blockwise_parallel_v1` as a reference.
+For the implementation in `bpt/`, the code in `bpt/blocks/blockwise_parallel.py` is optimized for simplicity and readability. A more optimized version in `bpt/blocks/blockwise_parallel_v1.py` is also provided, which explicitly instruct compiler to fuse certain ops and can serve as a reference for porting the code to low-level kernels. In our tests, the performance of `blockwise_parallel_v1` is slightly better than `blockwise_parallel`, but the difference is not significant. Because with blockwise parallel transformer, the compiler is able to fuse blockwise FFN and blockwise attention automatically.
 
 ## Usage
-An example script for training a 3B Transformers with 65536 context window length on 1 A100 80GB using blockwise parallel transformer is as follows. Firstly generate the training data (e.g OpenWebText) using `prepare_data.py`. Then run the following script:
+An example script for training a 3B Transformers with 65536 context window length on 1 A100 80GB using blockwise parallel transformer is as follows. Firstly generate the training data (e.g OpenWebText) using `scripts/prepare_data.py`. Then run the following script:
 ```bash
 #! /bin/bash
 
