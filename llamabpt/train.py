@@ -279,6 +279,7 @@ def main(argv):
                         sharded_rng, eval_metrics = sharded_eval_step(
                             train_state, sharded_rng, eval_batch
                         )
+                        eval_metrics = jax.device_get(eval_metrics)
                         eval_metric_list.append(eval_metrics)
                     metrics.update(average_metrics(eval_metric_list))
 
