@@ -479,9 +479,9 @@ class FlaxLLaMAAttention(nn.Module):
     def forward_qkv(self, hidden_states: jnp.ndarray, position_ids: jnp.ndarray) -> jnp.ndarray:
         xq, xk, xv = self.wq(hidden_states), self.wk(hidden_states), self.wv(hidden_states)
 
-        xq = with_sharding_constraint(xq, PS(("dp", "fsdp"), None, "mp"))
-        xk = with_sharding_constraint(xk, PS(("dp", "fsdp"), None, "mp"))
-        xv = with_sharding_constraint(xv, PS(("dp", "fsdp"), None, "mp"))
+        xq = with_sharding_constraint(xq, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
+        xk = with_sharding_constraint(xk, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
+        xv = with_sharding_constraint(xv, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
 
         xq = self._split_heads(xq)
         xk = self._split_heads(xk)
@@ -533,12 +533,12 @@ class FlaxLLaMAMLP(nn.Module):
         self.dropout = nn.Dropout(rate=self.config.resid_pdrop)
 
     def forward_ffn(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
-        x = with_sharding_constraint(x, PS(("dp", "fsdp"), None, None))
+        x = with_sharding_constraint(x, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
         x = nn.silu(self.w1(x)) * self.w3(x)
-        x = with_sharding_constraint(x, PS(("dp", "fsdp"), None, "mp"))
+        x = with_sharding_constraint(x, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
         x = self.w2(x)
         x = self.dropout(x, deterministic=deterministic)
-        x = with_sharding_constraint(x, PS(("dp", "fsdp"), None, None))
+        x = with_sharding_constraint(x, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
         return x
 
 
@@ -744,9 +744,9 @@ class Carry(NamedTuple):
 def blockwise_compute_attn(query, key, value, bias, deterministic,
         dropout_rng, attn_pdrop, causal_mask, query_chunk_size,
         key_chunk_size, dtype, policy, precision, prevent_cse):
-    query = with_sharding_constraint(query, PS(("dp", "fsdp"), None, "mp", None))
-    key = with_sharding_constraint(key, PS(("dp", "fsdp"), None, "mp", None))
-    value = with_sharding_constraint(value, PS(("dp", "fsdp"), None, "mp", None))
+    query = with_sharding_constraint(query, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp", "mp"))
+    key = with_sharding_constraint(key, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp", "mp"))
+    value = with_sharding_constraint(value, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp", "mp"))
     q_len = query.shape[1]
     kv_len = key.shape[1]
     query = rearrange(query, 'b (n c) h q -> b n c h q', c=query_chunk_size)
@@ -812,7 +812,7 @@ def blockwise_compute_attn(query, key, value, bias, deterministic,
     return res
 
 def blockwise_compute_ffn(cell, inputs, chunk_size, deterministic, policy, prevent_cse):
-    inputs = with_sharding_constraint(inputs, PS(("dp", "fsdp"), None, None))
+    inputs = with_sharding_constraint(inputs, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
     inputs = rearrange(inputs, 'b (n c) d -> b n c d', c=chunk_size)
     inputs = rearrange(inputs, 'b n c d -> n b c d')
     num_q, _, _, _ = inputs.shape
@@ -1202,6 +1202,7 @@ class FlaxLLaMAModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
+        self.wte = with_sharding_constraint(self.wte, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
         self.dropout = nn.Dropout(rate=self.config.embd_pdrop)
         self.h = FlaxLLaMABlockCollection(self.config, dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision)
         self.ln_f = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps, dtype=self.dtype, param_dtype=self.param_dtype)
@@ -1325,6 +1326,7 @@ class FlaxLLaMAForCausalLMModule(nn.Module):
             lm_logits = self.lm_head.apply({"params": {"kernel": shared_kernel}}, hidden_states)
         else:
             lm_logits = self.lm_head(hidden_states)
+        lm_logits = with_sharding_constraint(lm_logits, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
 
         if not return_dict:
             return (lm_logits,) + outputs[1:]

@@ -12,8 +12,8 @@ dependencies:
     - sentencepiece
     - cudatoolkit=11.8
     - cudnn=8.4
-    - jax=0.4.7
-    - jaxlib=0.4.7=*cuda*
+    - jax=0.4.13
+    - jaxlib=0.4.13=*cuda*
     - pytorch-gpu=2.0.0
     - pip:
         - flax==0.6.8
