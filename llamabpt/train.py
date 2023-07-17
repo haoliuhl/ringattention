@@ -136,7 +136,6 @@ def main(argv):
             blockwise_cross_entropy,
             policy=FLAGS.llama.remat_policy,
             chunk_size=FLAGS.llama.loss_chunk_size,
-            prevent_cse=not FLAGS.llama.scan_layers,
         )
     def train_step(train_state, rng, batch):
         rng_generator = JaxRNG(rng)

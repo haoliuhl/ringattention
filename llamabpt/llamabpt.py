@@ -35,10 +35,6 @@ from tux import function_args_to_config, load_pickle, open_file, with_sharding_c
 
 MASK_VALUE = -1e10
 
-Q_CHUNK_SIZE = 1024
-K_CHUNK_SIZE = 1024
-
-
 LLAMA_STANDARD_CONFIGS = {
     '3b': {
         'vocab_size': 32000,
@@ -181,10 +177,10 @@ class LLaMAConfig(PretrainedConfig):
         causal=True,
         remat_policy='nothing_saveable',
         q_chunk_size=1024,
-        k_chunk_size=2048,
+        k_chunk_size=1024,
         ffn_chunk_size=1024,
-        head_chunk_size=1024,
-        loss_chunk_size=1024,
+        head_chunk_size=-1,
+        loss_chunk_size=-1,
         scan_layers=True,
         param_scan_axis=0,
         float32_logits=False,
@@ -464,6 +460,8 @@ class FlaxLLaMAAttention(nn.Module):
             dtype=self.dtype,
         )
 
+        self.causal_mask = make_causal_mask(jnp.ones((1, self.config.max_sequence_length), dtype="bool"), dtype="bool")
+
     def _split_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.num_heads, self.head_dim))
 
@@ -479,17 +477,17 @@ class FlaxLLaMAAttention(nn.Module):
     def forward_qkv(self, hidden_states: jnp.ndarray, position_ids: jnp.ndarray) -> jnp.ndarray:
         xq, xk, xv = self.wq(hidden_states), self.wk(hidden_states), self.wv(hidden_states)
 
-        xq = with_sharding_constraint(xq, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
-        xk = with_sharding_constraint(xk, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
-        xv = with_sharding_constraint(xv, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
+        xq = with_sharding_constraint(xq, PS(("dp", "fsdp"), None, "mp"))
+        xk = with_sharding_constraint(xk, PS(("dp", "fsdp"), None, "mp"))
+        xv = with_sharding_constraint(xv, PS(("dp", "fsdp"), None, "mp"))
 
         xq = self._split_heads(xq)
         xk = self._split_heads(xk)
         xv = self._split_heads(xv)
 
-        xq = with_sharding_constraint(xq, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp", "mp"))
-        xk = with_sharding_constraint(xk, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp", "mp"))
-        xv = with_sharding_constraint(xv, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp", "mp"))
+        xq = with_sharding_constraint(xq, PS(("dp", "fsdp"), None, "mp", None))
+        xk = with_sharding_constraint(xk, PS(("dp", "fsdp"), None, "mp", None))
+        xv = with_sharding_constraint(xv, PS(("dp", "fsdp"), None, "mp", None))
 
         freqs_cis = jnp.take(self.freqs_cis, position_ids, axis=0)
 
@@ -537,12 +535,12 @@ class FlaxLLaMAMLP(nn.Module):
         self.dropout = nn.Dropout(rate=self.config.resid_pdrop)
 
     def forward_ffn(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
-        # x = with_sharding_constraint(x, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
+        # x = with_sharding_constraint(x, PS(("dp", "fsdp"), None, "mp"))
         x = nn.silu(self.w1(x)) * self.w3(x)
-        x = with_sharding_constraint(x, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
+        x = with_sharding_constraint(x, PS(("dp", "fsdp"), None, "mp"))
         x = self.w2(x)
         x = self.dropout(x, deterministic=deterministic)
-        # x = with_sharding_constraint(x, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
+        # x = with_sharding_constraint(x, PS(("dp", "fsdp"), None, "mp"))
         return x
 
 
@@ -558,7 +556,6 @@ class FlaxLLaMABlock(nn.Module):
         self.ffn_chunk_size = self.config.ffn_chunk_size
         self.causal = self.config.causal
         self.policy = self.config.remat_policy
-        self.prevent_cse = not self.config.scan_layers
         self.float32_logits = self.config.float32_logits
         self.attn_pdrop = self.config.attn_pdrop
         attention_module = FlaxLLaMAAttention
@@ -631,31 +628,40 @@ class FlaxLLaMABlock(nn.Module):
         output_attentions: bool = False,
         fcm_mask=None,
     ):
-        hidden_states = with_sharding_constraint(hidden_states, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
+        hidden_states = with_sharding_constraint(hidden_states, PS(("dp", "fsdp"), None, "mp"))
         hidden_states_norm = self.attention_norm(hidden_states)
-        hidden_states_norm = with_sharding_constraint(hidden_states_norm, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
+        hidden_states_norm = with_sharding_constraint(hidden_states_norm, PS(("dp", "fsdp"), None, "mp"))
         xq, xk, xv = self.attention.forward_qkv(hidden_states_norm, position_ids)
 
         dropout_rng = None
         if not deterministic and self.config.attn_pdrop > 0.0:
             dropout_rng = self.make_rng("dropout")
 
-        attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-
-        attention_bias = lax.select(
-            attention_mask > 0,
-            jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-            jnp.full(attention_mask.shape, -1e9).astype(self.dtype),
-        )
-
         # During fast autoregressive decoding, we feed one position at a time,
         # and cache the keys and values step by step.
-
         if self.has_variable("cache", "cached_key") or init_cache \
             or self.q_chunk_size <=0 or self.k_chunk_size <= 0:
+            query_length, key_length = xq.shape[1], xk.shape[1]
+            if self.has_variable("cache", "cached_key"):
+                mask_shift = self.variables["cache"]["cache_index"]
+                max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
+                causal_mask = lax.dynamic_slice(
+                    self.attention.causal_mask, (0, 0, mask_shift, 0), (1, 1, query_length, max_decoder_length)
+                )
+            else:
+                causal_mask = self.attention.causal_mask[:, :, :query_length, :key_length]
+            batch_size = hidden_states.shape[0]
+            causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
+            attention_mask = jnp.broadcast_to(jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape)
+            attention_mask = combine_masks(attention_mask, causal_mask, fcm_mask)
             if self.has_variable("cache", "cached_key") or init_cache:
                 xk, xv, attention_mask = self._concatenate_to_cache(xk, xv, xq, attention_mask)
-            # use standard dot product attention since query length is 1
+            # transform boolean mask into float mask
+            attention_bias = lax.select(
+                attention_mask > 0,
+                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+            )
             attn_weights = dot_product_attention_weights(
                 xq,
                 xk,
@@ -666,10 +672,15 @@ class FlaxLLaMABlock(nn.Module):
                 dtype=jnp.promote_types(self.dtype, jnp.float32),
                 precision=self.precision,
             )
-            # attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
             attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, xv, precision=self.precision)
             attn_output = self.attention.attn_out_proj(attn_output, deterministic=deterministic)
         else:
+            attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+            attention_bias = lax.select(
+                attention_mask > 0,
+                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+                jnp.full(attention_mask.shape, -1e9).astype(self.dtype),
+            )
             attn_output = blockwise_compute_attn(
                 xq,
                 xk,
@@ -684,11 +695,10 @@ class FlaxLLaMABlock(nn.Module):
                 dtype=self.dtype,
                 policy=self.policy,
                 precision=self.precision,
-                prevent_cse=self.prevent_cse,
             )
             attn_output = self.attention.attn_out_proj(attn_output, deterministic=deterministic)
             attn_weights = None
-        attn_output = with_sharding_constraint(attn_output, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
+        attn_output = with_sharding_constraint(attn_output, PS(("dp", "fsdp"), None, "mp"))
         ffn_input = self.ffn_norm(hidden_states + attn_output)
         if self.ffn_chunk_size <= 0:
             ffn_output = self.feed_forward.forward_ffn(
@@ -702,11 +712,10 @@ class FlaxLLaMABlock(nn.Module):
                 chunk_size=self.ffn_chunk_size,
                 deterministic=deterministic,
                 policy=self.policy,
-                prevent_cse=self.prevent_cse,
             )
-        ffn_output = with_sharding_constraint(ffn_output, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
+        ffn_output = with_sharding_constraint(ffn_output, PS(("dp", "fsdp"), None, "mp"))
         outputs = ffn_output + hidden_states + attn_output
-        outputs = with_sharding_constraint(outputs, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
+        outputs = with_sharding_constraint(outputs, PS(("dp", "fsdp"), None, "mp"))
         if self.config.scan_layers:
             outputs = (outputs, None)
         return outputs
@@ -753,10 +762,7 @@ class Carry(NamedTuple):
 
 def blockwise_compute_attn(query, key, value, bias, deterministic,
         dropout_rng, attn_pdrop, causal_mask, query_chunk_size,
-        key_chunk_size, dtype, policy, precision, prevent_cse):
-    query = with_sharding_constraint(query, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp", "mp"))
-    key = with_sharding_constraint(key, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp", "mp"))
-    value = with_sharding_constraint(value, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp", "mp"))
+        key_chunk_size, dtype, policy, precision):
     q_len = query.shape[1]
     kv_len = key.shape[1]
     query = rearrange(query, 'b (n c) h q -> b n c h q', c=query_chunk_size)
@@ -781,7 +787,7 @@ def blockwise_compute_attn(query, key, value, bias, deterministic,
     def _query_chunk_attention(args):
         query_chunk, query_chunk_idx = args
 
-        @functools.partial(jax.checkpoint, prevent_cse=prevent_cse,
+        @functools.partial(jax.checkpoint, prevent_cse=False,
                            policy=get_gradient_checkpoint_policy(policy))
         def summarize_chunk(carry, args):
             key_chunk, value_chunk, key_chunk_idx = args
@@ -821,19 +827,19 @@ def blockwise_compute_attn(query, key, value, bias, deterministic,
     res = rearrange(res, 'n b c h d -> b (n c) h d')
     return res
 
-def blockwise_compute_ffn(cell, inputs, chunk_size, deterministic, policy, prevent_cse):
-    inputs = with_sharding_constraint(inputs, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
+def blockwise_compute_ffn(cell, inputs, chunk_size, deterministic, policy):
+    inputs = with_sharding_constraint(inputs, PS(("dp", "fsdp"), None, "mp"))
     inputs = rearrange(inputs, 'b (n c) d -> b n c d', c=chunk_size)
     inputs = rearrange(inputs, 'b n c d -> n b c d')
     num_q, _, _, _ = inputs.shape
     def ffn(cell, _, hidden_states):
         outputs = cell.forward_ffn(hidden_states, deterministic=deterministic)
         return _, outputs
-    ffn_remat = nn.remat(
+    ffn_remat = nn_partitioning.remat(
         ffn,
         variables="params",
         rngs={"params" : False},
-        prevent_cse=prevent_cse,
+        prevent_cse=False,
         policy=get_gradient_checkpoint_policy(policy),
     )
     _, res = nn.scan(
@@ -851,7 +857,6 @@ class Blockwise_LM_Head(nn.Module):
     vocab_size: int
     chunk_size: int
     policy: str = 'nothing_saveable'
-    prevent_cse: bool = False
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Any = None
@@ -874,11 +879,11 @@ class Blockwise_LM_Head(nn.Module):
         def lm_head(cell, _, hidden_states):
             outputs = cell(hidden_states)
             return _, outputs
-        lm_head_remat = nn.remat(
+        lm_head_remat = nn_partitioning.remat(
             lm_head,
             variables="params",
             rngs={"params" : False},
-            prevent_cse=self.prevent_cse,
+            prevent_cse=False,
             policy=get_gradient_checkpoint_policy(self.policy),
         )
         _, res = nn.scan(
@@ -893,7 +898,7 @@ class Blockwise_LM_Head(nn.Module):
         return res
 
 def blockwise_cross_entropy(logits, tokens, valid=None,
-                            chunk_size=None, policy=None, prevent_cse=None):
+                            chunk_size=None, policy=None):
     if valid is None:
         valid = jnp.ones(tokens.shape[:2])
     valid = valid.astype(jnp.float32)
@@ -919,7 +924,7 @@ def blockwise_cross_entropy(logits, tokens, valid=None,
             jnp.array(False)
         )
         return token_log_prob, correct, valid_text_length
-    @partial(jax.checkpoint, prevent_cse=prevent_cse,
+    @partial(jax.checkpoint, prevent_cse=False,
              policy=get_gradient_checkpoint_policy(policy))
     def _loss_and_accuracy(carry, args):
         loss, accuracy, num = carry
@@ -1196,16 +1201,6 @@ class FlaxLLaMABlockCollection(nn.Module):
         return outputs
 
 
-class ShardedEmbed(nn.Embed):
-    def __call__(self, inputs):
-        if not jnp.issubdtype(inputs.dtype, jnp.integer):
-            raise ValueError('Input type must be an integer or unsigned integer.')
-        embedding, = nn.dtypes.promote_dtype(self.embedding, dtype=self.dtype, inexact=False)
-        output = jnp.take(embedding, inputs, axis=0)
-        output = with_sharding_constraint(output, PS(("dp", "fsdp"), None, "mp"))
-        return output
-
-
 class FlaxLLaMAModule(nn.Module):
     config: LLaMAConfig
     dtype: jnp.dtype = jnp.float32
@@ -1215,7 +1210,7 @@ class FlaxLLaMAModule(nn.Module):
     def setup(self):
         self.embed_dim = self.config.hidden_size
 
-        self.wte = ShardedEmbed(
+        self.wte = nn.Embed(
             self.config.vocab_size,
             self.config.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
@@ -1238,6 +1233,7 @@ class FlaxLLaMAModule(nn.Module):
         return_dict: bool = True,
     ):
         input_embeds = self.wte(input_ids.astype("i4"))
+        input_embeds = with_sharding_constraint(input_embeds, PS(("dp", "fsdp"), None, "mp"))
 
         hidden_states = self.dropout(input_embeds, deterministic=deterministic)
 
@@ -1302,7 +1298,6 @@ class FlaxLLaMAForCausalLMModule(nn.Module):
         else:
             self.lm_head = Blockwise_LM_Head(self.config.vocab_size,
                 self.config.head_chunk_size,
-                prevent_cse=not self.config.scan_layers,
                 precision=self.precision,
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
@@ -1345,7 +1340,7 @@ class FlaxLLaMAForCausalLMModule(nn.Module):
             lm_logits = self.lm_head.apply({"params": {"kernel": shared_kernel}}, hidden_states)
         else:
             lm_logits = self.lm_head(hidden_states)
-        lm_logits = with_sharding_constraint(lm_logits, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
+        lm_logits = with_sharding_constraint(lm_logits, PS(("dp", "fsdp"), None, "mp"))
 
         if not return_dict:
             return (lm_logits,) + outputs[1:]
