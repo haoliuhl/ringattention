@@ -487,6 +487,10 @@ class FlaxLLaMAAttention(nn.Module):
         xk = self._split_heads(xk)
         xv = self._split_heads(xv)
 
+        xq = with_sharding_constraint(xq, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp", "mp"))
+        xk = with_sharding_constraint(xk, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp", "mp"))
+        xv = with_sharding_constraint(xv, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp", "mp"))
+
         freqs_cis = jnp.take(self.freqs_cis, position_ids, axis=0)
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis, dtype=self.dtype)
@@ -533,12 +537,12 @@ class FlaxLLaMAMLP(nn.Module):
         self.dropout = nn.Dropout(rate=self.config.resid_pdrop)
 
     def forward_ffn(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
-        x = with_sharding_constraint(x, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
+        # x = with_sharding_constraint(x, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
         x = nn.silu(self.w1(x)) * self.w3(x)
         x = with_sharding_constraint(x, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
         x = self.w2(x)
         x = self.dropout(x, deterministic=deterministic)
-        x = with_sharding_constraint(x, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
+        # x = with_sharding_constraint(x, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
         return x
 
 
@@ -627,7 +631,10 @@ class FlaxLLaMABlock(nn.Module):
         output_attentions: bool = False,
         fcm_mask=None,
     ):
-        xq, xk, xv = self.attention.forward_qkv(self.attention_norm(hidden_states), position_ids)
+        hidden_states = with_sharding_constraint(hidden_states, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
+        hidden_states_norm = self.attention_norm(hidden_states)
+        hidden_states_norm = with_sharding_constraint(hidden_states_norm, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
+        xq, xk, xv = self.attention.forward_qkv(hidden_states_norm, position_ids)
 
         dropout_rng = None
         if not deterministic and self.config.attn_pdrop > 0.0:
@@ -659,7 +666,7 @@ class FlaxLLaMABlock(nn.Module):
                 dtype=jnp.promote_types(self.dtype, jnp.float32),
                 precision=self.precision,
             )
-            attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
+            # attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
             attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, xv, precision=self.precision)
             attn_output = self.attention.attn_out_proj(attn_output, deterministic=deterministic)
         else:
@@ -681,6 +688,7 @@ class FlaxLLaMABlock(nn.Module):
             )
             attn_output = self.attention.attn_out_proj(attn_output, deterministic=deterministic)
             attn_weights = None
+        attn_output = with_sharding_constraint(attn_output, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
         ffn_input = self.ffn_norm(hidden_states + attn_output)
         if self.ffn_chunk_size <= 0:
             ffn_output = self.feed_forward.forward_ffn(
@@ -696,7 +704,9 @@ class FlaxLLaMABlock(nn.Module):
                 policy=self.policy,
                 prevent_cse=self.prevent_cse,
             )
+        ffn_output = with_sharding_constraint(ffn_output, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
         outputs = ffn_output + hidden_states + attn_output
+        outputs = with_sharding_constraint(outputs, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
         if self.config.scan_layers:
             outputs = (outputs, None)
         return outputs
