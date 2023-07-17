@@ -1196,6 +1196,16 @@ class FlaxLLaMABlockCollection(nn.Module):
         return outputs
 
 
+class ShardedEmbed(nn.Embed):
+    def __call__(self, inputs):
+        if not jnp.issubdtype(inputs.dtype, jnp.integer):
+            raise ValueError('Input type must be an integer or unsigned integer.')
+        embedding, = nn.dtypes.promote_dtype(self.embedding, dtype=self.dtype, inexact=False)
+        output = jnp.take(embedding, inputs, axis=0)
+        output = with_sharding_constraint(output, PS(("dp", "fsdp"), None, "mp"))
+        return output
+
+
 class FlaxLLaMAModule(nn.Module):
     config: LLaMAConfig
     dtype: jnp.dtype = jnp.float32
@@ -1205,14 +1215,13 @@ class FlaxLLaMAModule(nn.Module):
     def setup(self):
         self.embed_dim = self.config.hidden_size
 
-        self.wte = nn.Embed(
+        self.wte = ShardedEmbed(
             self.config.vocab_size,
             self.config.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
-        self.wte = with_sharding_constraint(self.wte, PS(("dp", "fsdp"), ("dp", "fsdp"), "mp"))
         self.dropout = nn.Dropout(rate=self.config.embd_pdrop)
         self.h = FlaxLLaMABlockCollection(self.config, dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision)
         self.ln_f = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps, dtype=self.dtype, param_dtype=self.param_dtype)
