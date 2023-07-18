@@ -810,13 +810,27 @@ def blockwise_compute_attn(query, key, value, bias, deterministic,
             denominator = denominator * correction + exp_weights.sum(axis=-1, keepdims=True)
             return Carry(numerator, denominator, max_score), None
 
+        # optionally skip computation in the case where we know the result will be zero
+        def cond_summarize_chunk(carry, args):
+            key_chunk, value_chunk, key_chunk_idx = args
+            skip_block = jnp.array(False)
+            if causal_mask:
+                skip_block = query_chunk_idx < key_chunk_idx
+            return jax.lax.cond(
+                skip_block,
+                lambda carry, args: (carry, None),
+                summarize_chunk,
+                carry,
+                args,
+            )
+
         init_carry = Carry(
             jnp.zeros((batch, query_chunk_size, num_heads, dim_per_head), dtype=query.dtype),
             jnp.zeros((batch, query_chunk_size, num_heads, dim_per_head), dtype=query.dtype),
             (-jnp.inf) * jnp.ones((batch, query_chunk_size, num_heads, 1), dtype=query.dtype),
         )
         (numerator, denominator, max_score), _ = lax.scan(
-            summarize_chunk, init_carry, xs=(key, value, jnp.arange(0, num_kv))
+            cond_summarize_chunk, init_carry, xs=(key, value, jnp.arange(0, num_kv))
         )
         outputs = (numerator / denominator).astype(dtype)
         return outputs
