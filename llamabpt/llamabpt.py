@@ -33,8 +33,6 @@ from ml_collections.config_dict import config_dict
 from tux import function_args_to_config, load_pickle, open_file, with_sharding_constraint, get_jax_mesh, get_gradient_checkpoint_policy
 
 
-MASK_VALUE = -1e10
-
 LLAMA_STANDARD_CONFIGS = {
     '3b': {
         'vocab_size': 32000,
@@ -656,7 +654,6 @@ class FlaxLLaMABlock(nn.Module):
             attention_mask = combine_masks(attention_mask, causal_mask, fcm_mask)
             if self.has_variable("cache", "cached_key") or init_cache:
                 xk, xv, attention_mask = self._concatenate_to_cache(xk, xv, xq, attention_mask)
-            # transform boolean mask into float mask
             attention_bias = lax.select(
                 attention_mask > 0,
                 jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
@@ -679,7 +676,7 @@ class FlaxLLaMABlock(nn.Module):
             attention_bias = lax.select(
                 attention_mask > 0,
                 jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-                jnp.full(attention_mask.shape, -1e9).astype(self.dtype),
+                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
             )
             attn_output = blockwise_compute_attn(
                 xq,
@@ -723,10 +720,10 @@ class FlaxLLaMABlock(nn.Module):
 
 def _chunk_attention_bias(query_chunk_size, key_chunk_size,
             bias, deterministic, attn_dropout, attn_pdrop, causal_mask,
-            query_chunk_idx, key_chunk_idx):
+            dtype, query_chunk_idx, key_chunk_idx):
     query_offset = query_chunk_idx * query_chunk_size
     key_offset = key_chunk_idx * key_chunk_size
-    chunk_bias = jnp.zeros((1, 1, 1, 1))
+    chunk_bias = jnp.zeros((1, 1, 1, 1), dtype=dtype)
     if bias is not None:
         chunk_bias = lax.dynamic_slice(
             bias,
@@ -739,7 +736,7 @@ def _chunk_attention_bias(query_chunk_size, key_chunk_size,
         key_idx = lax.broadcasted_iota(dtype=jnp.int32, shape=(1, key_chunk_size), dimension=1)
         offset = query_offset - key_offset
         query_idx += offset
-        causal_mask_value = (query_idx < key_idx) * MASK_VALUE
+        causal_mask_value = (query_idx < key_idx) * jnp.finfo(dtype).min
         chunk_bias += causal_mask_value.reshape(1, 1, *causal_mask_value.shape)
 
     if not deterministic and attn_pdrop > 0.0:
@@ -752,17 +749,21 @@ def _chunk_attention_bias(query_chunk_size, key_chunk_size,
                 min(attn_dropout.shape[-1], key_chunk_size),
             ),
         )
-        chunk_bias -= attn_dropout_slice * 1e6
-    return chunk_bias
+        chunk_bias += attn_dropout_slice * jnp.finfo(dtype).min
+    return chunk_bias.astype(dtype)
+
 
 class Carry(NamedTuple):
     numerator: jax.Array
     denominator: jax.Array
     max_so_far: jax.Array
 
+
 def blockwise_compute_attn(query, key, value, bias, deterministic,
         dropout_rng, attn_pdrop, causal_mask, query_chunk_size,
         key_chunk_size, dtype, policy, precision):
+    depth = query.shape[-1]
+    query = query / jnp.sqrt(depth).astype(dtype)
     q_len = query.shape[1]
     kv_len = key.shape[1]
     query = rearrange(query, 'b (n c) h q -> b n c h q', c=query_chunk_size)
@@ -781,8 +782,8 @@ def blockwise_compute_attn(query, key, value, bias, deterministic,
 
     _chunk_bias_fn = functools.partial(
         _chunk_attention_bias,
-        query_chunk_size, key_chunk_size,
-        bias, deterministic, attn_dropout, attn_pdrop, causal_mask)
+        query_chunk_size, key_chunk_size, bias, deterministic,
+        attn_dropout, attn_pdrop, causal_mask, dtype)
 
     def _query_chunk_attention(args):
         query_chunk, query_chunk_idx = args
@@ -827,6 +828,7 @@ def blockwise_compute_attn(query, key, value, bias, deterministic,
     res = rearrange(res, 'n b c h d -> b (n c) h d')
     return res
 
+
 def blockwise_compute_ffn(cell, inputs, chunk_size, deterministic, policy):
     inputs = with_sharding_constraint(inputs, PS(("dp", "fsdp"), None, "mp"))
     inputs = rearrange(inputs, 'b (n c) d -> b n c d', c=chunk_size)
@@ -852,6 +854,7 @@ def blockwise_compute_ffn(cell, inputs, chunk_size, deterministic, policy):
     )(cell, None, inputs)
     res = rearrange(res, 'n b c d -> b (n c) d')
     return res
+
 
 class Blockwise_LM_Head(nn.Module):
     vocab_size: int
@@ -896,6 +899,7 @@ class Blockwise_LM_Head(nn.Module):
         )(self.lm_head, None, inputs)
         res = rearrange(res, 'n b c d -> b (n c) d')
         return res
+
 
 def blockwise_cross_entropy(logits, tokens, valid=None,
                             chunk_size=None, policy=None):
@@ -946,6 +950,7 @@ def blockwise_cross_entropy(logits, tokens, valid=None,
     loss = - loss / num
     accuracy = accuracy / num
     return loss, accuracy
+
 
 class FlaxLLaMAPreTrainedModel(FlaxPreTrainedModel):
     """
