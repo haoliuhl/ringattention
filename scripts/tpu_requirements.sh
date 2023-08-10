@@ -20,10 +20,9 @@ cat > $HOME/tpu_requirements.txt <<- EndOfFile
 jax[tpu]==0.4.13
 tensorflow==2.11.0
 tensorboard-plugin-profile
-flax==0.6.8
-optax==0.1.4
-chex==0.1.7
-distrax==0.1.3
+flax==0.7.0
+optax==0.1.7
+chex==0.1.82
 einops
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.0.0
@@ -35,9 +34,8 @@ wandb
 gcsfs
 requests
 typing-extensions
-lm-eval
 sentencepiece
-tux==0.0.2
+tux @ git+https://github.com/lhao499/tux.git
 EndOfFile
 
 pip install --upgrade -r $HOME/tpu_requirements.txt
