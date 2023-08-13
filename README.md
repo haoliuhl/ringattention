@@ -22,19 +22,18 @@ sh tpu_requirements.sh
 
 The code is organized as follows:
 - `scripts/` contains the requirements and scripts for preparing the data.
-- `llamabpt/` contains the implementation of BPT on top of LLaMA.
+- `llamabpt/` contains the example of applying BPT to LLaMA.
 
 The implementation optimized sharding annotations for distributed FSDP training. It also supports BPT, memeff/flashattention, and vanilla transformer.
 
 ## Usage
 
-Use `q_chunk_size` and `k_chunk_size` to control the number of chunks in the self-attention.
-Use `ffn_chunk_size` to control the number of chunks in the feed-forward network.
-Use `loss_chunk_size` to control the number of chunks in the final loss computation.
+Use `scan_query_chunk_size` and `scan_key_chunk_size` to control the block size in blockwise compute of the self-attention.
+Use `scan_mlp_chunk_size` to control the block size in blockwise compute of the feedforward network.
 
-For these arguments, set to -1 to disable chunking. For example, `--llama.ffn_chunk_size=-1` and `--llama.loss_chunk_size=-1` disables blockwise parallelism in the feed-forward network and loss function, which reduces BPT to the memory-efficient transformer.
+Use `scan_attention=True` and `scan_mlp=True` to enable/disable blockwise compute in the self-attention and feed-forward network.
 
-Use `remat_policy` to control the rematerialization policy, recommended is `nothing_saveable`.
+Use `remat_attention` and `remat_mlp` to control the rematerialization policy, recommended is `nothing_saveable`.
 
 For the LLaMA tokenizer, you can use OpenLLaMAv2 tokenizer or the official LLaMA tokenizer.
 
@@ -68,13 +67,16 @@ python3 -m llamabpt.train \
     --train_dataset.json_dataset.batch_size=64 \
     --train_dataset.json_dataset.tokenizer_processes=16 \
     --checkpointer.save_optimizer_state=True \
+    --llama.scan_attention=True \
+    --llama.remat_attention='nothing_saveable' \
+    --llama.scan_query_chunk_size=2048 \
+    --llama.scan_key_chunk_size=4096 \
+    --llama.scan_mlp=True \
+    --llama.remat_mlp='nothing_saveable' \
+    --llama.scan_mlp_chunk_size=2048 \
+    --llama.remat_block='' \
     --llama.scan_layers=True \
     --llama.param_scan_axis=0 \
-    --llama.q_chunk_size=2048 \
-    --llama.k_chunk_size=4096 \
-    --llama.ffn_chunk_size=2048 \
-    --llama.loss_chunk_size=-1 \
-    --llama.remat_policy='nothing_saveable' \
     --llama.max_sequence_length=32768 \
     --autoresume=True
 ```

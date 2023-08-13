@@ -22,7 +22,6 @@ from tux import (
     OptimizerFactory, StreamingCheckpointer
 )
 from llamabpt.llama import LLaMAConfig, FlaxLLaMAForCausalLMModule
-from llamabpt.bpt import blockwise_cross_entropy
 
 
 FLAGS, FLAGS_DEF = define_flags_with_default(
@@ -84,12 +83,14 @@ def main(argv):
         llama_config = LLaMAConfig.load_config(FLAGS.load_llama_config)
         updates = LLaMAConfig(**FLAGS.llama)
         llama_config.update(dict(
-            q_chunk_size=updates.q_chunk_size,
-            k_chunk_size=updates.k_chunk_size,
-            ffn_chunk_size=updates.ffn_chunk_size,
-            loss_chunk_size=updates.loss_chunk_size,
-            max_sequence_length=updates.max_sequence_length,
-            remat_policy=updates.remat_policy,
+            remat_block=updates.remat_block,
+            remat_attention=updates.remat_attention,
+            remat_mlp=updates.remat_mlp,
+            scan_attention=updates.scan_attention,
+            scan_mlp=updates.scan_mlp,
+            scan_query_chunk_size=updates.scan_query_chunk_size,
+            scan_key_chunk_size=updates.scan_key_chunk_size,
+            scan_mlp_chunk_size=updates.scan_mlp_chunk_size,
             scan_layers=updates.scan_layers,
             param_scan_axis=updates.param_scan_axis,
         ))
@@ -128,14 +129,6 @@ def main(argv):
         )
         return TrainState.create(params=params, tx=optimizer, apply_fn=None)
 
-    if FLAGS.llama.loss_chunk_size <= 0:
-        cross_entropy_func = cross_entropy_loss_and_accuracy
-    else:
-        cross_entropy_func = partial(
-            blockwise_cross_entropy,
-            policy=FLAGS.llama.remat_policy,
-            chunk_size=FLAGS.llama.loss_chunk_size,
-        )
     def train_step(train_state, rng, batch):
         rng_generator = JaxRNG(rng)
         batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
@@ -144,7 +137,7 @@ def main(argv):
                 params, batch['input_tokens'], deterministic=False,
                 rngs=rng_generator(llama_config.rng_keys()),
             ).logits
-            return cross_entropy_func(
+            return cross_entropy_loss_and_accuracy(
                 logits, batch['target_tokens'], batch['loss_masks']
             )
         grad_fn = jax.value_and_grad(loss_and_accuracy, has_aux=True)
@@ -166,7 +159,7 @@ def main(argv):
             train_state.params, batch['input_tokens'], deterministic=True,
             rngs=rng_generator(llama_config.rng_keys()),
         ).logits
-        loss, accuracy = cross_entropy_func(
+        loss, accuracy = cross_entropy_loss_and_accuracy(
             logits, batch['target_tokens'], batch['loss_masks']
         )
         metrics = dict(
