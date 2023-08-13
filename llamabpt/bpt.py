@@ -149,7 +149,6 @@ def blockwise_ffn(cell, inputs, chunk_size, deterministic, policy):
     ffn_remat = nn_partitioning.remat(
         ffn,
         variables="params",
-        split_rngs={"params": False, "dropout": True},
         prevent_cse=False,
         policy=get_gradient_checkpoint_policy(policy),
     )
