@@ -31,6 +31,7 @@ from transformers.utils import add_start_docstrings, add_start_docstrings_to_mod
 from ml_collections import ConfigDict
 from ml_collections.config_dict import config_dict
 from tux import function_args_to_config, load_pickle, open_file, with_sharding_constraint, get_jax_mesh, get_gradient_checkpoint_policy
+from llamabpt.bpt import blockwise_attn, blockwise_ffn
 
 
 LLAMA_STANDARD_CONFIGS = {
@@ -177,11 +178,9 @@ class LLaMAConfig(PretrainedConfig):
         q_chunk_size=1024,
         k_chunk_size=1024,
         ffn_chunk_size=1024,
-        head_chunk_size=-1,
         loss_chunk_size=-1,
         scan_layers=True,
         param_scan_axis=0,
-        float32_logits=False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -203,11 +202,9 @@ class LLaMAConfig(PretrainedConfig):
         self.q_chunk_size = q_chunk_size
         self.k_chunk_size = k_chunk_size
         self.ffn_chunk_size = ffn_chunk_size
-        self.head_chunk_size = head_chunk_size
         self.loss_chunk_size = loss_chunk_size
         self.scan_layers = scan_layers
         self.param_scan_axis = param_scan_axis
-        self.float32_logits = float32_logits
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
@@ -409,7 +406,6 @@ class FlaxLLaMAAttention(nn.Module):
     dtype: jnp.dtype=jnp.float32
     param_dtype: jnp.dtype=jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]]=None
-    float32_logits: bool=False
 
     def setup(self):
         config = self.config
@@ -491,10 +487,6 @@ class FlaxLLaMAAttention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis, dtype=self.dtype)
 
-        if self.float32_logits:
-            xq = xq.astype(jnp.float32)
-            xk = xk.astype(jnp.float32)
-
         return xq, xk, xv
 
 class FlaxLLaMAMLP(nn.Module):
@@ -554,7 +546,6 @@ class FlaxLLaMABlock(nn.Module):
         self.ffn_chunk_size = self.config.ffn_chunk_size
         self.causal = self.config.causal
         self.policy = self.config.remat_policy
-        self.float32_logits = self.config.float32_logits
         self.attn_pdrop = self.config.attn_pdrop
         attention_module = FlaxLLaMAAttention
         mlp_module = FlaxLLaMAMLP
@@ -563,7 +554,6 @@ class FlaxLLaMABlock(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            float32_logits=self.float32_logits,
         )
         self.feed_forward = mlp_module(
             self.config,
@@ -678,20 +668,21 @@ class FlaxLLaMABlock(nn.Module):
                 jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
                 jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
             )
-            attn_output = blockwise_compute_attn(
+            attn_output = blockwise_attn(
                 xq,
                 xk,
                 xv,
                 bias=attention_bias,
-                deterministic=not deterministic,
+                deterministic=deterministic,
                 dropout_rng=dropout_rng,
                 attn_pdrop=self.attn_pdrop,
-                causal_mask=self.causal,
+                causal=self.causal,
                 query_chunk_size=self.q_chunk_size,
                 key_chunk_size=self.k_chunk_size,
                 dtype=self.dtype,
                 policy=self.policy,
                 precision=self.precision,
+                float32_logits=True,
             )
             attn_output = self.attention.attn_out_proj(attn_output, deterministic=deterministic)
             attn_weights = None
@@ -703,7 +694,7 @@ class FlaxLLaMABlock(nn.Module):
                 deterministic,
             )
         else:
-            ffn_output = blockwise_compute_ffn(
+            ffn_output = blockwise_ffn(
                 self.feed_forward,
                 ffn_input,
                 chunk_size=self.ffn_chunk_size,
@@ -716,254 +707,6 @@ class FlaxLLaMABlock(nn.Module):
         if self.config.scan_layers:
             outputs = (outputs, None)
         return outputs
-
-
-def _chunk_attention_bias(query_chunk_size, key_chunk_size,
-            bias, deterministic, attn_dropout, attn_pdrop, causal_mask,
-            dtype, query_chunk_idx, key_chunk_idx):
-    query_offset = query_chunk_idx * query_chunk_size
-    key_offset = key_chunk_idx * key_chunk_size
-    chunk_bias = jnp.zeros((1, 1, 1, 1), dtype=dtype)
-    if bias is not None:
-        chunk_bias = lax.dynamic_slice(
-            bias,
-            start_indices=(0, 0, query_offset, key_offset),
-            slice_sizes=(*bias.shape[:2], min(bias.shape[-2], query_chunk_size), min(bias.shape[-1], key_chunk_size)),
-        )
-
-    if causal_mask:
-        query_idx = lax.broadcasted_iota(dtype=jnp.int32, shape=(query_chunk_size, 1), dimension=0)
-        key_idx = lax.broadcasted_iota(dtype=jnp.int32, shape=(1, key_chunk_size), dimension=1)
-        offset = query_offset - key_offset
-        query_idx += offset
-        causal_mask_value = (query_idx < key_idx) * jnp.finfo(dtype).min
-        chunk_bias += causal_mask_value.reshape(1, 1, *causal_mask_value.shape)
-
-    if not deterministic and attn_pdrop > 0.0:
-        attn_dropout_slice = lax.dynamic_slice(
-            attn_dropout,
-            start_indices=(0, 0, query_offset, key_offset),
-            slice_sizes=(
-                *attn_dropout.shape[:2],
-                min(attn_dropout.shape[-2], query_chunk_size),
-                min(attn_dropout.shape[-1], key_chunk_size),
-            ),
-        )
-        chunk_bias += attn_dropout_slice * jnp.finfo(dtype).min
-    return chunk_bias.astype(dtype)
-
-
-class Carry(NamedTuple):
-    numerator: jax.Array
-    denominator: jax.Array
-    max_so_far: jax.Array
-
-
-def blockwise_compute_attn(query, key, value, bias, deterministic,
-        dropout_rng, attn_pdrop, causal_mask, query_chunk_size,
-        key_chunk_size, dtype, policy, precision):
-    depth = query.shape[-1]
-    query = query / jnp.sqrt(depth).astype(dtype)
-    q_len = query.shape[1]
-    kv_len = key.shape[1]
-    query = rearrange(query, 'b (n c) h q -> b n c h q', c=query_chunk_size)
-    key, value = map(lambda t: rearrange(t, 'b (n c) h v -> b n c h v', c=key_chunk_size), (key, value))
-    query, key, value = map(lambda t: rearrange(t, 'b n c h d -> n b c h d'), (query, key, value))
-    num_q, batch, _, num_heads, dim_per_head = query.shape
-    num_kv, _, _, _, _ = key.shape
-
-    for bias_dim, broadcast_dim in zip(bias.shape, (batch, num_heads, q_len, kv_len)):
-        assert bias_dim == 1 or bias_dim == broadcast_dim
-    if not deterministic and attn_pdrop > 0.0:
-        attn_dropout_rng, dropout_rng = jax.random.split(dropout_rng)
-        attn_dropout = jax.random.bernoulli(attn_dropout_rng, attn_pdrop, (batch, num_heads, q_len, kv_len))
-    else:
-        attn_dropout = None
-
-    _chunk_bias_fn = functools.partial(
-        _chunk_attention_bias,
-        query_chunk_size, key_chunk_size, bias, deterministic,
-        attn_dropout, attn_pdrop, causal_mask, dtype)
-
-    def _query_chunk_attention(args):
-        query_chunk, query_chunk_idx = args
-
-        @functools.partial(jax.checkpoint, prevent_cse=False,
-                           policy=get_gradient_checkpoint_policy(policy))
-        def summarize_chunk(carry, args):
-            key_chunk, value_chunk, key_chunk_idx = args
-            (numerator, denominator, prev_max_score) = carry
-            attn_weights = jnp.einsum('bqhd,bkhd->bqhk', query_chunk, key_chunk, precision=precision)
-            bias_chunk = _chunk_bias_fn(query_chunk_idx, key_chunk_idx)
-            bias_chunk = jnp.moveaxis(bias_chunk, 1, 2)
-            attn_weights = attn_weights + bias_chunk
-
-            max_score = jnp.max(attn_weights, axis=-1, keepdims=True)
-            max_score = jnp.maximum(prev_max_score, max_score)
-            max_score = jax.lax.stop_gradient(max_score)
-            exp_weights = jnp.exp(attn_weights - max_score)
-            exp_values = jnp.einsum(
-                'bqhv,bvhf->bqhf', exp_weights, value_chunk, precision=precision
-            )
-            correction = jnp.exp(prev_max_score - max_score)
-            numerator = numerator * correction + exp_values
-            denominator = denominator * correction + exp_weights.sum(axis=-1, keepdims=True)
-            return Carry(numerator, denominator, max_score), None
-
-        # optionally skip computation in the case where we know the result will be zero
-        def cond_summarize_chunk(carry, args):
-            key_chunk, value_chunk, key_chunk_idx = args
-            skip_block = jnp.array(False)
-            if causal_mask:
-                skip_block = query_chunk_idx < key_chunk_idx
-            return jax.lax.cond(
-                skip_block,
-                lambda carry, args: (carry, None),
-                summarize_chunk,
-                carry,
-                args,
-            )
-
-        init_carry = Carry(
-            jnp.zeros((batch, query_chunk_size, num_heads, dim_per_head), dtype=query.dtype),
-            jnp.zeros((batch, query_chunk_size, num_heads, dim_per_head), dtype=query.dtype),
-            (-jnp.inf) * jnp.ones((batch, query_chunk_size, num_heads, 1), dtype=query.dtype),
-        )
-        (numerator, denominator, max_score), _ = lax.scan(
-            cond_summarize_chunk, init_carry, xs=(key, value, jnp.arange(0, num_kv))
-        )
-        outputs = (numerator / denominator).astype(dtype)
-        return outputs
-
-    _, res = lax.scan(
-        lambda _, x: ((), _query_chunk_attention(x)),
-        (), xs=(query, jnp.arange(0, num_q))
-    )
-    res = rearrange(res, 'n b c h d -> b (n c) h d')
-    return res
-
-
-def blockwise_compute_ffn(cell, inputs, chunk_size, deterministic, policy):
-    inputs = with_sharding_constraint(inputs, PS(("dp", "fsdp"), None, "mp"))
-    inputs = rearrange(inputs, 'b (n c) d -> b n c d', c=chunk_size)
-    inputs = rearrange(inputs, 'b n c d -> n b c d')
-    num_q, _, _, _ = inputs.shape
-    def ffn(cell, _, hidden_states):
-        outputs = cell.forward_ffn(hidden_states, deterministic=deterministic)
-        return _, outputs
-    ffn_remat = nn_partitioning.remat(
-        ffn,
-        variables="params",
-        rngs={"params" : False},
-        prevent_cse=False,
-        policy=get_gradient_checkpoint_policy(policy),
-    )
-    _, res = nn.scan(
-        ffn_remat,
-        variable_broadcast="params",
-        split_rngs={"params": False},
-        in_axes=0,
-        out_axes=0,
-        length=num_q,
-    )(cell, None, inputs)
-    res = rearrange(res, 'n b c d -> b (n c) d')
-    return res
-
-
-class Blockwise_LM_Head(nn.Module):
-    vocab_size: int
-    chunk_size: int
-    policy: str = 'nothing_saveable'
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
-    precision: Any = None
-    initializer_range: float = None
-
-    def setup(self):
-        self.lm_head = nn.Dense(
-            self.vocab_size,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=self.initializer_range),
-            precision=self.precision,
-        )
-
-    def __call__(self, inputs):
-        inputs = rearrange(inputs, 'b (n c) d -> b n c d', c=self.chunk_size)
-        inputs = rearrange(inputs, 'b n c d -> n b c d')
-        num_q, _, _, _ = inputs.shape
-        def lm_head(cell, _, hidden_states):
-            outputs = cell(hidden_states)
-            return _, outputs
-        lm_head_remat = nn_partitioning.remat(
-            lm_head,
-            variables="params",
-            rngs={"params" : False},
-            prevent_cse=False,
-            policy=get_gradient_checkpoint_policy(self.policy),
-        )
-        _, res = nn.scan(
-            lm_head_remat,
-            variable_broadcast="params",
-            split_rngs={"params": False},
-            in_axes=0,
-            out_axes=0,
-            length=num_q,
-        )(self.lm_head, None, inputs)
-        res = rearrange(res, 'n b c d -> b (n c) d')
-        return res
-
-
-def blockwise_cross_entropy(logits, tokens, valid=None,
-                            chunk_size=None, policy=None):
-    if valid is None:
-        valid = jnp.ones(tokens.shape[:2])
-    valid = valid.astype(jnp.float32)
-    logits = jnp.reshape(logits, (-1, logits.shape[-1]))
-    tokens = jnp.reshape(tokens, (-1,))
-    valid = jnp.reshape(valid, (-1,))
-
-    def _cross_entropy_loss_and_accuracy(logits, tokens, valid):
-        valid_text_length = jnp.maximum(jnp.sum(valid, axis=-1), 1e-10)
-
-        token_log_prob = jnp.squeeze(
-            jnp.take_along_axis(
-                jax.nn.log_softmax(logits, axis=-1),
-                jnp.expand_dims(tokens, -1),
-                axis=-1,
-            ),
-            -1,
-        )
-        token_log_prob = jnp.where(valid > 0.0, token_log_prob, jnp.array(0.0))
-        correct = jnp.where(
-            valid > 0.0,
-            jnp.argmax(logits, axis=-1) == tokens,
-            jnp.array(False)
-        )
-        return token_log_prob, correct, valid_text_length
-    @partial(jax.checkpoint, prevent_cse=False,
-             policy=get_gradient_checkpoint_policy(policy))
-    def _loss_and_accuracy(carry, args):
-        loss, accuracy, num = carry
-        logits, tokens, valid = args
-        token_log_prob, correct, valid_text_length = \
-            _cross_entropy_loss_and_accuracy(logits, tokens, valid)
-        loss = loss + jnp.sum(token_log_prob, axis=-1) / valid_text_length
-        accuracy = accuracy + jnp.sum(correct, axis=-1) / valid_text_length
-        num = num + 1
-        return (loss, accuracy, num), None
-    num_chunk = logits.shape[0] // chunk_size
-    logits = rearrange(logits, '(n c) d -> n c d', c=chunk_size)
-    tokens = rearrange(tokens, '(n c) -> n c', c=chunk_size)
-    valid = rearrange(valid, '(n c) -> n c', c=chunk_size)
-    (loss, accuracy, num), _ = jax.lax.scan(
-        _loss_and_accuracy, (0.0, 0.0, 0), xs=(logits, tokens, valid),
-        length=num_chunk,
-    )
-    loss = - loss / num
-    accuracy = accuracy / num
-    return loss, accuracy
 
 
 class FlaxLLaMAPreTrainedModel(FlaxPreTrainedModel):
@@ -1289,14 +1032,6 @@ class FlaxLLaMAModule(nn.Module):
 class FlaxLLaMAModel(FlaxLLaMAPreTrainedModel):
     module_class = FlaxLLaMAModule
 
-# append_call_sample_docstring(
-#     FlaxLLaMAModel,
-#     _TOKENIZER_FOR_DOC,
-#     _CHECKPOINT_FOR_DOC,
-#     FlaxCausalLMOutput,
-#     _CONFIG_FOR_DOC,
-# )
-
 class FlaxLLaMAForCausalLMModule(nn.Module):
     config: LLaMAConfig
     dtype: jnp.dtype = jnp.float32
@@ -1305,22 +1040,14 @@ class FlaxLLaMAForCausalLMModule(nn.Module):
 
     def setup(self):
         self.transformer = FlaxLLaMAModule(self.config, dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision)
-        if self.config.head_chunk_size <= 0:
-            self.lm_head = nn.Dense(
-                self.config.vocab_size,
-                dtype=self.dtype,
-                param_dtype=self.param_dtype,
-                use_bias=False,
-                kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-                precision=self.precision,
-            )
-        else:
-            self.lm_head = Blockwise_LM_Head(self.config.vocab_size,
-                self.config.head_chunk_size,
-                precision=self.precision,
-                dtype=self.dtype,
-                param_dtype=self.param_dtype,
-                initializer_range=self.config.initializer_range,)
+        self.lm_head = nn.Dense(
+            self.config.vocab_size,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+            precision=self.precision,
+        )
 
     def __call__(
         self,
@@ -1371,7 +1098,7 @@ class FlaxLLaMAForCausalLMModule(nn.Module):
 class FlaxLLaMAForCausalLM(FlaxLLaMAPreTrainedModel):
     module_class = FlaxLLaMAForCausalLMModule
 
-    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[jnp.DeviceArray] = None):
+    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[jax.Array] = None):
         # initializing the cache
         batch_size, seq_length = input_ids.shape
 

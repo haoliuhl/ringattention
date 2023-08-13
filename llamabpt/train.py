@@ -21,7 +21,8 @@ from tux import (
     make_shard_and_gather_fns, with_sharding_constraint, define_flags_with_default,
     OptimizerFactory, StreamingCheckpointer
 )
-from llamabpt.llamabpt import LLaMAConfig, FlaxLLaMAForCausalLMModule, blockwise_cross_entropy
+from llamabpt.llama import LLaMAConfig, FlaxLLaMAForCausalLMModule
+from llamabpt.bpt import blockwise_cross_entropy
 
 
 FLAGS, FLAGS_DEF = define_flags_with_default(
@@ -86,13 +87,11 @@ def main(argv):
             q_chunk_size=updates.q_chunk_size,
             k_chunk_size=updates.k_chunk_size,
             ffn_chunk_size=updates.ffn_chunk_size,
-            head_chunk_size=updates.head_chunk_size,
             loss_chunk_size=updates.loss_chunk_size,
             max_sequence_length=updates.max_sequence_length,
             remat_policy=updates.remat_policy,
             scan_layers=updates.scan_layers,
             param_scan_axis=updates.param_scan_axis,
-            float32_logits=updates.float32_logits,
         ))
     else:
         llama_config = LLaMAConfig(**FLAGS.llama)
