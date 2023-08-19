@@ -77,8 +77,7 @@ python3 -m llamabpt.train \
     --llama.remat_block='' \
     --llama.scan_layers=True \
     --llama.param_scan_axis=0 \
-    --llama.max_sequence_length=32768 \
-    --autoresume=True
+    --llama.max_sequence_length=32768
 ```
 
 For large scale distributed training on TPU or on GPU cluster with good inter connection, we recommend first using FSDP, and add tensor parallelism when the model is very large or the global batch size is too large. You can control parallelism by using mesh_dim.
