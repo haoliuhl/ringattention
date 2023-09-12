@@ -1,12 +1,12 @@
-# Blockwise Parallel Transformer for Long Context Large Models
+# Blockwise Parallel Transformer for Large Context Models
 
 Hao Liu, Pieter Abbeel
 
 Paper: https://arxiv.org/abs/2305.19370
 
-This is the implementation of the Blockwise Parallel Transformer (BPT) model. The model is described in the paper [Blockwise Parallel Transformer for Long Context Large Models](https://arxiv.org/pdf/2305.19370.pdf).
+This is the implementation of the Blockwise Parallel Transformer (BPT) model. The model is described in the paper [Blockwise Parallel Transformer for Large Context Models](https://arxiv.org/pdf/2305.19370.pdf).
 
-BPT allows training 32x longer sequence length than vanilla transformer with the same memory cost and 4x longer than memeff / flashattention.
+BPT allows training about sequence len times longer sequence length than vanilla transformer with the same memory cost and four times longer than memeff / flashattention.
 
 ## Requirements
 Install the requirements with:
