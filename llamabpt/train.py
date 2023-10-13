@@ -26,7 +26,7 @@ from llamabpt.llama import LLaMAConfig, FlaxLLaMAForCausalLMModule
 
 FLAGS, FLAGS_DEF = define_flags_with_default(
     seed=42,
-    mesh_dim='1,-1,1',
+    mesh_dim='1,-1,1,1',
     dtype='bf16',
     total_steps=10000,
     load_llama_config='',
@@ -131,7 +131,7 @@ def main(argv):
 
     def train_step(train_state, rng, batch):
         rng_generator = JaxRNG(rng)
-        batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
+        batch = with_sharding_constraint(batch, PS(('dp', 'fsdp'), 'sp'))
         def loss_and_accuracy(params):
             logits = model.apply(
                 params, batch['input_tokens'], deterministic=False,
@@ -154,7 +154,7 @@ def main(argv):
 
     def eval_step(train_state, rng, batch):
         rng_generator = JaxRNG(rng)
-        batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
+        batch = with_sharding_constraint(batch, PS(('dp', 'fsdp'), 'sp'))
         logits = model.apply(
             train_state.params, batch['input_tokens'], deterministic=True,
             rngs=rng_generator(llama_config.rng_keys()),
@@ -170,7 +170,7 @@ def main(argv):
 
     train_state_shapes = jax.eval_shape(init_fn, next_rng())
     train_state_partition = match_partition_rules(
-        LLaMAConfig.get_partition_rules(FLAGS.llama.scan_layers, FLAGS.llama.param_scan_axis), train_state_shapes
+        LLaMAConfig.get_partition_rules(llama_config.scan_layers, llama_config.param_scan_axis), train_state_shapes
     )
 
     shard_fns, gather_fns = make_shard_and_gather_fns(

@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.sharding import PartitionSpec as PS
+from jax.experimental.shard_map import shard_map
 import flax.linen as nn
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks, make_causal_mask
@@ -29,7 +30,7 @@ from transformers.utils import add_start_docstrings, add_start_docstrings_to_mod
 from ml_collections import ConfigDict
 from ml_collections.config_dict import config_dict
 from tux import function_args_to_config, load_pickle, open_file,  with_sharding_constraint, get_jax_mesh, get_gradient_checkpoint_policy
-from bpt import blockwise_ffn, blockwise_attn
+from bpt import blockwise_ffn, blockwise_attn, ring_attention
 
 
 LLAMA_STANDARD_CONFIGS = {
@@ -185,6 +186,7 @@ class LLaMAConfig(PretrainedConfig):
         remat_attention='',
         remat_mlp='',
         scan_attention=False,
+        attention_type=None,
         scan_mlp=False,
         scan_query_chunk_size=1024,
         scan_key_chunk_size=1024,
@@ -193,6 +195,7 @@ class LLaMAConfig(PretrainedConfig):
         fcm_max_ratio=0.0,
         scan_layers=True,
         param_scan_axis=0,
+        mesh_dim=None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -211,6 +214,7 @@ class LLaMAConfig(PretrainedConfig):
         self.remat_attention = remat_attention
         self.remat_mlp = remat_mlp
         self.scan_attention = scan_attention
+        self.attention_type = attention_type
         self.scan_mlp = scan_mlp
         self.scan_query_chunk_size = scan_query_chunk_size
         self.scan_key_chunk_size = scan_key_chunk_size
@@ -219,6 +223,7 @@ class LLaMAConfig(PretrainedConfig):
         self.fcm_max_ratio = fcm_max_ratio
         self.scan_layers = scan_layers
         self.param_scan_axis = param_scan_axis
+        self.mesh_dim = mesh_dim
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
@@ -237,7 +242,7 @@ class LLaMAConfig(PretrainedConfig):
 
     @staticmethod
     def get_jax_mesh(axis_dims):
-        return get_jax_mesh(axis_dims, ('dp', 'fsdp', 'mp'))
+        return get_jax_mesh(axis_dims, ('dp', 'fsdp', 'tp', 'sp'))
 
     @staticmethod
     def get_partition_rules(scan_layers=False, scan_axis=0):
@@ -250,39 +255,39 @@ class LLaMAConfig(PretrainedConfig):
             if scan_axis == 0:
                 return (
                     # embeddings
-                    ("transformer/wte/embedding", PS("mp", "fsdp")),
+                    ("transformer/wte/embedding", PS("tp", ("fsdp", "sp"))),
                     # atention
-                    ("attention/(wq|wk|wv)/kernel", PS(None, "fsdp", "mp")),
-                    ("attention/wo/kernel", PS(None, "mp", "fsdp")),
+                    ("attention/(wq|wk|wv)/kernel", PS(None, ("fsdp", "sp"), "tp")),
+                    ("attention/wo/kernel", PS(None, "tp", ("fsdp", "sp"))),
                     # mlp
-                    ("feed_forward/w1/kernel", PS(None, "fsdp", "mp")),
-                    ("feed_forward/w2/kernel", PS(None, "mp", "fsdp")),
-                    ("feed_forward/w3/kernel", PS(None, "fsdp", "mp")),
+                    ("feed_forward/w1/kernel", PS(None, ("fsdp", "sp"), "tp")),
+                    ("feed_forward/w2/kernel", PS(None, "tp", ("fsdp", "sp"))),
+                    ("feed_forward/w3/kernel", PS(None, ("fsdp", "sp"), "tp")),
                     # layer norms
                     ("attention_norm/kernel", PS(None, None)),
                     ("ffn_norm/kernel", PS(None, None)),
                     # output head
                     ("transformer/ln_f/kernel", PS(None)),
-                    ("lm_head/kernel", PS("fsdp", "mp")),
+                    ("lm_head/kernel", PS(("fsdp", "sp"), "tp")),
                     ('.*', PS(None)),
                 )
             elif scan_axis == 1:
                 return (
                     # embeddings
-                    ("transformer/wte/embedding", PS("mp", "fsdp")),
+                    ("transformer/wte/embedding", PS("tp", ("fsdp", "sp"))),
                     # atention
-                    ("attention/(wq|wk|wv)/kernel", PS("fsdp", None, "mp")),
-                    ("attention/wo/kernel", PS("mp", None, "fsdp")),
+                    ("attention/(wq|wk|wv)/kernel", PS(("fsdp", "sp"), None, "tp")),
+                    ("attention/wo/kernel", PS("tp", None, ("fsdp", "sp"))),
                     # mlp
-                    ("feed_forward/w1/kernel", PS("fsdp", None, "mp")),
-                    ("feed_forward/w2/kernel", PS("mp", None, "fsdp")),
-                    ("feed_forward/w3/kernel", PS("fsdp", None, "mp")),
+                    ("feed_forward/w1/kernel", PS(("fsdp", "sp"), None, "tp")),
+                    ("feed_forward/w2/kernel", PS("tp", None, ("fsdp", "sp"))),
+                    ("feed_forward/w3/kernel", PS(("fsdp", "sp"), None, "tp")),
                     # layer norms
                     ("attention_norm/kernel", PS(None, None)),
                     ("ffn_norm/kernel", PS(None, None)),
                     # output head
                     ("transformer/ln_f/kernel", PS(None)),
-                    ("lm_head/kernel", PS("fsdp", "mp")),
+                    ("lm_head/kernel", PS(("fsdp", "sp"), "tp")),
                     ('.*', PS(None)),
                 )
             else:
@@ -290,20 +295,20 @@ class LLaMAConfig(PretrainedConfig):
         else:
             return (
                 # embeddings
-                ("transformer/wte/embedding", PS("mp", "fsdp")),
+                ("transformer/wte/embedding", PS("tp", ("fsdp", "sp"))),
                 # atention
-                ("attention/(wq|wk|wv)/kernel", PS("fsdp", "mp")),
-                ("attention/wo/kernel", PS("mp", "fsdp")),
+                ("attention/(wq|wk|wv)/kernel", PS(("fsdp", "sp"), "tp")),
+                ("attention/wo/kernel", PS("tp", ("fsdp", "sp"))),
                 # mlp
-                ("feed_forward/w1/kernel", PS("fsdp", "mp")),
-                ("feed_forward/w2/kernel", PS("mp", "fsdp")),
-                ("feed_forward/w3/kernel", PS("fsdp", "mp")),
+                ("feed_forward/w1/kernel", PS(("fsdp", "sp"), "tp")),
+                ("feed_forward/w2/kernel", PS("tp", ("fsdp", "sp"))),
+                ("feed_forward/w3/kernel", PS(("fsdp", "sp"), "tp")),
                 # layer norms
                 ("attention_norm/kernel", PS(None)),
                 ("ffn_norm/kernel", PS(None)),
                 # output head
                 ("transformer/ln_f/kernel", PS(None)),
-                ("lm_head/kernel", PS("fsdp", "mp")),
+                ("lm_head/kernel", PS(("fsdp", "sp"), "tp")),
                 ('.*', PS(None)),
             )
 
@@ -520,9 +525,9 @@ class FlaxLLaMAAttention(nn.Module):
     ):
         xq, xk, xv = self.wq(hidden_states), self.wk(hidden_states), self.wv(hidden_states)
 
-        xq = with_sharding_constraint(xq, PS(("dp", "fsdp"), None, "mp"))
-        xk = with_sharding_constraint(xk, PS(("dp", "fsdp"), None, "mp"))
-        xv = with_sharding_constraint(xv, PS(("dp", "fsdp"), None, "mp"))
+        xq = with_sharding_constraint(xq, PS(("dp", "fsdp"), "sp", "tp"))
+        xk = with_sharding_constraint(xk, PS(("dp", "fsdp"), "sp", "tp"))
+        xv = with_sharding_constraint(xv, PS(("dp", "fsdp"), "sp", "tp"))
 
         xq = self._split_heads(xq)
         xk = self._split_heads(xk)
@@ -536,11 +541,15 @@ class FlaxLLaMAAttention(nn.Module):
         if not deterministic and self.config.attn_pdrop > 0.0:
             dropout_rng = self.make_rng("dropout")
 
-        if self.config.scan_attention and not (self.has_variable("cache", "cached_key") or init_cache):
+        # if self.config.scan_attention and not (self.has_variable("cache", "cached_key") or init_cache):
+        if self.config.attention_type in ['ring_blockwise', 'blockwise']:
             # doesn't need blockwise attention if we are doing autoregressive decoding since no quadratic memory
 
             # attention mask without nxn materlization, blockwise_attn will handle the rest
             attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+
+            attn_weights = None
+
             # transform boolean mask into float mask
             attention_bias = lax.select(
                 attention_mask > 0,
@@ -548,24 +557,56 @@ class FlaxLLaMAAttention(nn.Module):
                 jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
             )
             attn_weights = None
-            attn_output = blockwise_attn(
-                xq,
-                xk,
-                xv,
-                bias=attention_bias,
-                deterministic=deterministic,
-                dropout_rng=dropout_rng,
-                attn_pdrop=self.config.attn_pdrop,
-                causal=True,
-                query_chunk_size=self.config.scan_query_chunk_size,
-                key_chunk_size=self.config.scan_key_chunk_size,
-                dtype=self.dtype,
-                policy=get_gradient_checkpoint_policy('nothing_saveable'),
-                precision=self.precision,
-                float32_logits=True,
-                prevent_cse=not self.config.scan_layers,
-            )
-            attn_output = with_sharding_constraint(attn_output, PS(("dp", "fsdp"), None, "mp", None))
+
+            if self.config.attention_type == 'ring_blockwise':
+                ring_attention_sharded = shard_map(
+                    partial(
+                        ring_attention,
+                        axis_name="sp",
+                        float32_logits=True,
+                        blockwise_kwargs=dict(
+                            deterministic=deterministic,
+                            dropout_rng=dropout_rng,
+                            attn_pdrop=self.config.attn_pdrop,
+                            causal=True,
+                            query_chunk_size=self.config.scan_query_chunk_size,
+                            key_chunk_size=self.config.scan_key_chunk_size,
+                            dtype=self.dtype,
+                            policy=get_gradient_checkpoint_policy('nothing_saveable'),
+                            precision=self.precision,
+                            prevent_cse=not self.config.scan_layers,
+                        )
+                    ),
+                    mesh=LLaMAConfig.get_jax_mesh(self.config.mesh_dim),
+                    in_specs=(
+                        PS(("dp", "fsdp"), "sp", "tp", None),
+                        PS(("dp", "fsdp"), "sp", "tp", None),
+                        PS(("dp", "fsdp"), "sp", "tp", None),
+                        PS(("dp", "fsdp"), None, None, None)
+                    ),
+                    out_specs=PS(("dp", "fsdp"), "sp", "tp", None),
+                    check_rep=False
+                )
+                attn_output = ring_attention_sharded(xq, xk, xv, attention_bias)
+            elif self.config.attention_type == 'blockwise':
+                attn_output = blockwise_attn(
+                    xq, xk, xv, attention_bias,
+                    deterministic=deterministic,
+                    dropout_rng=dropout_rng,
+                    attn_pdrop=self.config.attn_pdrop,
+                    causal=True,
+                    query_chunk_size=self.config.scan_query_chunk_size,
+                    key_chunk_size=self.config.scan_key_chunk_size,
+                    dtype=self.dtype,
+                    policy=get_gradient_checkpoint_policy('nothing_saveable'),
+                    precision=self.precision,
+                    float32_logits=True,
+                    prevent_cse=not self.config.scan_layers,
+                )
+            else:
+                raise Exception(self.config.attention_type)
+
+            attn_output = with_sharding_constraint(attn_output, PS(("dp", "fsdp"), "sp", "tp", None))
         else:
             query_length, key_length = xq.shape[1], xk.shape[1]
 
@@ -589,24 +630,26 @@ class FlaxLLaMAAttention(nn.Module):
             if self.has_variable("cache", "cached_key") or init_cache:
                 xk, xv, attention_mask = self._concatenate_to_cache(xk, xv, xq, attention_mask)
 
-            # transform boolean mask into float mask
-            attention_bias = lax.select(
-                attention_mask > 0,
-                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
-            )
-            attn_weights = dot_product_attention_weights(
-                xq,
-                xk,
-                bias=attention_bias,
-                dropout_rng=dropout_rng,
-                dropout_rate=self.config.attn_pdrop,
-                deterministic=deterministic,
-                dtype=jnp.promote_types(self.dtype, jnp.float32),
-                precision=self.precision,
-            )
-            attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
-            attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, xv, precision=self.precision)
+            if self.config.attention_type == 'standard':
+                attention_bias = lax.select(
+                    attention_mask > 0,
+                    jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+                    jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+                )
+                attn_weights = dot_product_attention_weights(
+                    xq,
+                    xk,
+                    bias=attention_bias,
+                    dropout_rng=dropout_rng,
+                    dropout_rate=self.config.attn_pdrop,
+                    deterministic=deterministic,
+                    dtype=jnp.promote_types(self.dtype, jnp.float32),
+                    precision=self.precision,
+                )
+                attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "tp", "sp", None))
+                attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, xv, precision=self.precision)
+            else:
+                raise Exception(self.config.attention_type)
 
         attn_output = self._merge_heads(attn_output)
         attn_output = self.wo(attn_output)
@@ -739,7 +782,7 @@ class FlaxLLaMABlock(nn.Module):
                 feed_forward_input,
                 deterministic,
             )
-        feed_forward_hidden_states = with_sharding_constraint(feed_forward_hidden_states, PS(("dp", "fsdp"), None, "mp"))
+        feed_forward_hidden_states = with_sharding_constraint(feed_forward_hidden_states, PS(("dp", "fsdp"), None, "tp"))
 
         hidden_states = hidden_states + feed_forward_hidden_states
 
