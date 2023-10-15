@@ -68,7 +68,7 @@ python3 -m llamabpt.train \
     --save_model_freq=0 \
     --save_milestone_freq=1000 \
     --load_llama_config='13b' \
-    --update_llama_config="dict(max_sequence_length=32768,scan_attention=True,scan_query_chunk_size=2048,scan_key_chunk_size=4096,remat_attention='nothing_saveable',scan_mlp=True,scan_mlp_chunk_size=2048,remat_mlp='nothing_saveable',remat_block='nothing_saveable',scan_layers=True,attention_type='blockwise',param_scan_axis=0)" \
+    --update_llama_config="dict(max_sequence_length=32768,scan_attention=True,scan_query_chunk_size=2048,scan_key_chunk_size=4096,remat_attention='nothing_saveable',scan_mlp=True,scan_mlp_chunk_size=2048,remat_mlp='nothing_saveable',remat_block='nothing_saveable',scan_layers=True,attention_type='blockwise',param_scan_axis=0,mesh_dim='1,64,4,1')" \
     --load_dataset_state='' \
     --load_checkpoint='' \
     --tokenizer.vocab_file="<path to your llama tokenizer>" \
@@ -99,7 +99,7 @@ python3 -m llamabpt.train \
     --save_model_freq=0 \
     --save_milestone_freq=1000 \
     --load_llama_config='7b' \
-    --update_llama_config="dict(max_sequence_length=2097152,scan_attention=True,scan_query_chunk_size=2048,scan_key_chunk_size=4096,remat_attention='nothing_saveable',scan_mlp=True,scan_mlp_chunk_size=2048,remat_mlp='nothing_saveable',remat_block='nothing_saveable',scan_layers=True,attention_type='ring_blockwise',param_scan_axis=0)" \
+    --update_llama_config="dict(max_sequence_length=2097152,scan_attention=True,scan_query_chunk_size=2048,scan_key_chunk_size=4096,remat_attention='nothing_saveable',scan_mlp=True,scan_mlp_chunk_size=2048,remat_mlp='nothing_saveable',remat_block='nothing_saveable',scan_layers=True,attention_type='ring_blockwise',param_scan_axis=0,mesh_dim='1,1,4,64')" \
     --load_dataset_state='' \
     --load_checkpoint='' \
     --tokenizer.vocab_file="<path to your llama tokenizer>" \
@@ -122,6 +122,21 @@ Switching between BPT and Ring Attention is as simple as changing the `attention
 
 For large scale end-to-end training on TPU or on GPU cluster with high bandwidth inter connection, we recommend using FSDP to shard large models and using \ours to achieve large context. If total batch size is too large, add tensor parallelism to reduce the global batch size. The degree of parallelism can be adjusted using the \texttt{mesh\_dim} parameter within the codebase.
 To illustrate, consider a setup with 512 devices, such as 512x A100. If the model size is 30B, you can shard it across 8 devices and allocate the remaining 32 devices for \ours. This setup allows the context size to be expanded 32 times more than if you didn't use \ours. Conversely, for models sized 7B or 3B, there is no need for FSDP. This means you can utilize all 512 devices exclusively to expand the context using \ours by 512 times. Building upon the result that our approach allows for a 256K context size when using 8x A100 GPUs, it suggests that by employing 512 A100 GPUs, the potential context size can be expanded to 16 million.
+
+For finetuning purposes, e.g., finetuning a huggingface hosted model. We provide a script to convert huggingface model to our format. The script is in `scripts/hf2jax.py`. The script takes in a downloaded huggingface model path and outputs a jax format.
+The usage is as follows:
+```bash
+python hf2jax.py  \
+       --checkpoint_dir /path/hf_format_dir/    \
+       --output_file /path/output   \
+       --model_size 7b \
+       --streaming
+```
+Then you can load the model using the `--load_checkpoint` flag:
+```bash
+--load_checkpoint='params::/path/output'
+```
+Note that only LLaMA-1 and its variants are supported for now, and set `scan_layers=False` for loading huggingface models.
 
 *Note for Ring Attention*: Ring Attention can train up to device count times longer sequences than previous bests (BPT, memeff, flashattention). However, the current implementation is not optimized for speed, since it uses Jax high level APIs. We recommend porting the code to Jax low level APIs such as Pallas or Triton to achieve optimal speed.
 

@@ -12,6 +12,7 @@ import jax.numpy as jnp
 from jax.experimental.pjit import pjit
 from jax.sharding import PartitionSpec as PS
 from flax.training.train_state import TrainState
+import flax
 
 from llamabpt.data import DatasetFactory
 from tux import (
@@ -245,6 +246,7 @@ def main(argv):
             train_state = sharded_init_fn(next_rng())
         elif train_state is None and restored_params is not None:
             # Restore from params but initialize train_state
+            restored_params = flax.core.frozen_dict.unfreeze(restored_params)
             train_state = sharded_create_trainstate_from_params(restored_params)
             del restored_params
 
