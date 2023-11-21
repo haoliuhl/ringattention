@@ -107,6 +107,7 @@ def main(argv):
     ))
     if llama_config.vocab_size < dataset.vocab_size:
         llama_config.update(dict(vocab_size=dataset.vocab_size))
+    llama_config.update(dict(mesh_dim=FLAGS.mesh_dim))
 
     model = FlaxLLaMAForCausalLMModule(
         llama_config, dtype=get_float_dtype_by_name(FLAGS.dtype)
@@ -122,10 +123,11 @@ def main(argv):
 
     def init_fn(rng):
         rng_generator = JaxRNG(rng)
+        batch = 512
         params = model.init(
-            input_ids=jnp.zeros((4, seq_length), dtype=jnp.int32),
-            position_ids=jnp.zeros((4, seq_length), dtype=jnp.int32),
-            attention_mask=jnp.ones((4, seq_length), dtype=jnp.int32),
+            input_ids=jnp.zeros((batch, seq_length), dtype=jnp.int32),
+            position_ids=jnp.zeros((batch, seq_length), dtype=jnp.int32),
+            attention_mask=jnp.ones((batch, seq_length), dtype=jnp.int32),
             rngs=rng_generator(llama_config.rng_keys()),
         )
         return TrainState.create(params=params, tx=optimizer, apply_fn=None)
@@ -246,7 +248,6 @@ def main(argv):
             train_state = sharded_init_fn(next_rng())
         elif train_state is None and restored_params is not None:
             # Restore from params but initialize train_state
-            restored_params = flax.core.frozen_dict.unfreeze(restored_params)
             train_state = sharded_create_trainstate_from_params(restored_params)
             del restored_params
 

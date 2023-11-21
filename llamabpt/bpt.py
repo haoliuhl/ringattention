@@ -1,14 +1,15 @@
+import numpy as np
 import flax.linen as nn
 import jax
 import jax.lax as lax
 import jax.numpy as jnp
 from einops import rearrange
 from functools import partial
+from llamabpt.flash_attention_tpu import _flash_attention_fwd, _flash_attention_bwd, BlockSizes
 
-"""Ring Attention Implementation
-Ring Attention with Blockwise Transformers for Near-Infinite Context https://arxiv.org/abs/2310.01889 Liu et al. 2023.
 
-Ring Attention generalizes blockwise attention and distributes the attention computation across multiple devices, allowing up to number of devices times longer sequences than BPT.
+"""
+Ring Attention with (a) scan and (b) pallas
 """
 def _ring_attention_fwd(q, k, v, attn_bias, axis_name, float32_logits, blockwise_kwargs):
     if float32_logits:
@@ -34,7 +35,6 @@ def _ring_attention_fwd(q, k, v, attn_bias, axis_name, float32_logits, blockwise
         numerator = numerator * correction + jnp.einsum("bhqk,bkd->bqhd", exp_weights, v)
         denominator = denominator * jnp.exp(prev_max_score - max_score) + jnp.sum(exp_weights, axis=-1)
         '''
-        # blockwise version
         attn_bias_slice = lax.dynamic_slice_in_dim(attn_bias,
             (lax.axis_index(axis_name) - idx) % axis_size * kv_len, kv_len, axis=-1
         )
@@ -57,9 +57,9 @@ def _ring_attention_bwd(axis_name, float32_logits, blockwise_kwargs, res, g):
     batch, q_len, num_heads, dim_per_head = q.shape
     batch, kv_len, num_heads, dim_per_head = k.shape
     axis_size = lax.psum(1, axis_name)
-    dq = jnp.zeros_like(q, dtype=jnp.float32)
-    dk = jnp.zeros_like(k, dtype=jnp.float32)
-    dv = jnp.zeros_like(v, dtype=jnp.float32)
+    dq = jnp.zeros_like(q, dtype=q.dtype)
+    dk = jnp.zeros_like(k, dtype=k.dtype)
+    dv = jnp.zeros_like(v, dtype=k.dtype)
     query_chunk_size = blockwise_kwargs["query_chunk_size"]
     key_chunk_size = blockwise_kwargs["key_chunk_size"]
     block_size = q.shape[1] # assumes this function is pre-sharded inside shard_map
@@ -77,7 +77,6 @@ def _ring_attention_bwd(axis_name, float32_logits, blockwise_kwargs, res, g):
         # dk = dk + jnp.einsum("bqhd,bhqk->bkd", q, dl) / scale
         # dv = dv + jnp.einsum("bhqk,bqhd->bkd", exp_weights, g)
         '''
-        # blockwise version
         attn_bias_slice = lax.dynamic_slice_in_dim(attn_bias,
             (lax.axis_index(axis_name) - idx) % axis_size * kv_len, kv_len, axis=-1
         )
@@ -90,7 +89,7 @@ def _ring_attention_bwd(axis_name, float32_logits, blockwise_kwargs, res, g):
             (i + 1) % axis_size) for i in range(axis_size)]), (k, v, dk, dv))
         return (dq, dk, dv, k, v), None
     (dq, dk, dv, k, v), _ = lax.scan(scan_kv_block, init=(dq, dk, dv, k, v), xs=jnp.arange(0, axis_size))
-    dq, dk, dv = dq.astype(q.dtype), dk.astype(k.dtype), dv.astype(v.dtype)
+    dq, dk, dv = dq.astype(q.dtype), dk.astype(k.dtype), dv.astype(k.dtype)
     return dq, dk, dv, None
 
 @partial(jax.custom_vjp, nondiff_argnums=[4, 5, 6])
@@ -99,6 +98,74 @@ def ring_attention(q, k, v, attn_bias, axis_name, float32_logits, blockwise_kwar
     return y
 
 ring_attention.defvjp(_ring_attention_fwd, _ring_attention_bwd)
+
+
+def _ring_attention_standard_fwd(q, k, v, attn_mask, axis_name, float32_logits):
+    if float32_logits:
+        q, k = q.astype(jnp.float32), k.astype(jnp.float32)
+    batch, q_len, num_heads, _ = q.shape
+    batch, kv_len, num_heads, dim_per_head = k.shape
+    numerator = jnp.zeros((batch, q_len, num_heads, dim_per_head)).astype(q.dtype)
+    denominator = jnp.zeros((batch, num_heads, q_len)).astype(q.dtype)
+    axis_size = lax.psum(1, axis_name)
+    scale = jnp.sqrt(q.shape[-1])
+    def scan_kv_block(carry, idx):
+        prev_max_score, numerator, denominator, k, v = carry
+        mask = lax.dynamic_slice_in_dim(attn_mask,
+            (lax.axis_index(axis_name) - idx) % axis_size * kv_len, kv_len, axis=-1)
+        attn_weights = jnp.einsum("bqhd,bkhd->bhqk", q, k) / scale
+        # attn_weights = jnp.where(mask, -jnp.inf, attn_weights)
+        attn_weights = jnp.where(mask, attn_weights, -jnp.inf)
+        max_score = jnp.maximum(prev_max_score, jnp.max(attn_weights, axis=-1))
+        exp_weights = jnp.exp(attn_weights - max_score[..., None])
+        correction = rearrange(jnp.exp(prev_max_score - max_score), 'b h q -> b q h')[..., None]
+        numerator = numerator * correction + jnp.einsum("bhqk,bkhd->bqhd", exp_weights, v)
+        denominator = denominator * jnp.exp(prev_max_score - max_score) + jnp.sum(exp_weights, axis=-1)
+        k, v = map(lambda x: lax.ppermute(x, axis_name, perm=[(i,
+            (i + 1) % axis_size) for i in range(axis_size)]), (k, v))
+        return (max_score, numerator, denominator, k, v), None
+    prev_max_score = jnp.full((batch, num_heads, q_len), -jnp.inf).astype(q.dtype)
+    (max_score, numerator, denominator, _, _), _ = lax.scan(scan_kv_block,
+    init=(prev_max_score, numerator, denominator, k, v), xs=jnp.arange(0, axis_size))
+    output = numerator / rearrange(denominator, 'b h q -> b q h')[..., None]
+    return output.astype(v.dtype), (output, q, k, v, attn_mask, numerator, denominator, max_score)
+
+def _ring_attention_standard_bwd(axis_name, float32_logits, res, g):
+    del float32_logits
+    axis_size = lax.psum(1, axis_name)
+    output, q, k, v, attn_mask, numerator, denominator, max_score = res
+    dq = jnp.zeros_like(q, dtype=jnp.float32)
+    dk = jnp.zeros_like(k, dtype=jnp.float32)
+    dv = jnp.zeros_like(v, dtype=jnp.float32)
+    batch, kv_len, num_heads, dim_per_head = k.shape
+    scale = jnp.sqrt(q.shape[-1])
+    def scan_kv_block(carry, idx):
+        dq, dk, dv, k, v = carry
+        mask = lax.dynamic_slice_in_dim(attn_mask,
+            (lax.axis_index(axis_name) - idx) % axis_size * kv_len, kv_len, axis=-1)
+        attn_weights = jnp.einsum("bqhd,bkhd->bhqk", q, k) / scale
+        # attn_weights = jnp.where(mask, -jnp.inf, attn_weights)
+        attn_weights = jnp.where(mask, attn_weights, -jnp.inf)
+        exp_weights = jnp.exp(attn_weights - max_score[..., None]) / denominator[..., None]
+        ds = jnp.einsum("bqhd,bkhd->bhqk", g, v)
+        dl = (ds - jnp.einsum("bqhd,bqhd->bhq", g, output)[..., None]) * exp_weights
+        dq = dq + jnp.einsum("bhqk,bkhd->bqhd", dl, k) / scale
+        dk = dk + jnp.einsum("bqhd,bhqk->bkhd", q, dl) / scale
+        dv = dv + jnp.einsum("bhqk,bqhd->bkhd", exp_weights, g)
+        k, v, dk, dv = map(lambda x: lax.ppermute(x, axis_name, perm=[(i,
+            (i + 1) % axis_size) for i in range(axis_size)]), (k, v, dk, dv))
+        return (dq, dk, dv, k, v), None
+    (dq, dk, dv, k, v), _ = lax.scan(scan_kv_block, init=(dq, dk, dv, k, v), xs=jnp.arange(0, axis_size))
+    dq, dk, dv = dq.astype(q.dtype), dk.astype(k.dtype), dv.astype(v.dtype)
+    return dq, dk, dv, None
+
+@partial(jax.custom_vjp, nondiff_argnums=[4, 5])
+def ring_attention_standard(q, k, v, attn_mask, axis_name, float32_logits=True):
+    y, _ = _ring_attention_standard_fwd(q, k, v, attn_mask, axis_name, float32_logits)
+    return y
+
+ring_attention_standard.defvjp(_ring_attention_standard_fwd, _ring_attention_standard_bwd)
+
 
 def _blockwise_attention_fwd(q, k, v, carry, q_chunk_idx_start, k_chunk_idx_start, bias, causal, query_chunk_size,
                              key_chunk_size, deterministic, dropout_rng, attn_pdrop, dtype, policy, precision, prevent_cse):
@@ -138,8 +205,10 @@ def _blockwise_attention_fwd(q, k, v, carry, q_chunk_idx_start, k_chunk_idx_star
         def scan_kv_block(carry, scan):
             k_chunk, value_chunk, k_chunk_idx = scan
             numerator_chunk, denominator_chunk, prev_max_score_chunk = carry
+            # attn_weights = jnp.einsum('bqhd,bkhd->bqhk', q_chunk, k_chunk, precision=precision) / scale
             attn_weights = jnp.einsum('bqhd,bkhd->bhqk', q_chunk, k_chunk, precision=precision) / scale
             bias_chunk = _chunk_bias_fn(q_chunk_idx_start + q_chunk_idx, k_chunk_idx_start + k_chunk_idx)
+            # bias_chunk = jnp.moveaxis(bias_chunk, 1, 2)
             attn_weights = attn_weights + bias_chunk
 
             max_score_chunk = jnp.maximum(prev_max_score_chunk, jnp.max(attn_weights, axis=-1))
@@ -147,7 +216,13 @@ def _blockwise_attention_fwd(q, k, v, carry, q_chunk_idx_start, k_chunk_idx_star
             exp_weights = jnp.exp(attn_weights - max_score_chunk[..., None])
             exp_values = jnp.einsum('bhqk,bkhd->bqhd', exp_weights, value_chunk, precision=precision)
             correction = rearrange(jnp.exp(prev_max_score_chunk - max_score_chunk), 'b h q -> b q h')[..., None]
+            # max_score_chunk = jnp.max(attn_weights, axis=-1, keepdims=True)
+            # max_score_chunk = jnp.maximum(prev_max_score_chunk, max_score_chunk)
+            # exp_weights = jnp.exp(attn_weights - max_score_chunk)
+            # exp_values = jnp.einsum('bqhv,bvhd->bqhd', exp_weights, value_chunk, precision=precision)
+            # correction = jnp.exp(prev_max_score_chunk - max_score_chunk)
             numerator_chunk = numerator_chunk * correction + exp_values
+            # denominator_chunk = denominator_chunk * correction + exp_weights.sum(axis=-1, keepdims=True)
             denominator_chunk = denominator_chunk * jnp.exp(prev_max_score_chunk - max_score_chunk) + exp_weights.sum(axis=-1)
             return (numerator_chunk, denominator_chunk, max_score_chunk), None
 
@@ -167,9 +242,11 @@ def _blockwise_attention_fwd(q, k, v, carry, q_chunk_idx_start, k_chunk_idx_star
         (numerator_chunk, denominator_chunk, max_score_chunk), _ = lax.scan(
             skip_upper_half, init=(numerator_chunk, denominator_chunk, max_score_chunk), xs=(k, v, jnp.arange(0, num_kv))
         )
+        # output_chunk = (numerator_chunk / denominator_chunk).astype(dtype)
         output_chunk = numerator_chunk / rearrange(denominator_chunk, 'b h q -> b q h')[..., None].astype(dtype)
         return (), (output_chunk, numerator_chunk, denominator_chunk, max_score_chunk)
     _, (_, numerator, denominator, max_score) = lax.scan(scan_attention, init=(), xs=(q, numerator, denominator, max_score, jnp.arange(0, num_q)))
+    # numerator, denominator, max_score = map(lambda x: rearrange(x, 'n b c h d -> b (n c) h d'), (numerator, denominator, max_score))
 
     numerator = jnp.moveaxis(numerator, 1, 0)
     numerator = numerator.reshape((batch, q_len, num_heads, dim_per_head))
@@ -250,7 +327,10 @@ def _blockwise_attention_bwd(q, k, v, g, carry, q_chunk_idx_start, k_chunk_idx_s
                         jnp.zeros((batch, key_chunk_size, num_heads, dim_per_head), dtype=dk.dtype),
                     )
                 ),
-                scan_kv_block, carry, args)
+                scan_kv_block,
+                carry,
+                args
+            )
 
         dq_chunk, (dk_part, dv_part) = lax.scan(
             skip_upper_half, init=dq_chunk, xs=(k, v, jnp.arange(0, num_kv))
@@ -416,6 +496,313 @@ def _chunk_attention_bias(query_chunk_size, key_chunk_size,
         )
         chunk_bias += attn_dropout_slice * jnp.finfo(dtype).min
     return chunk_bias.astype(dtype)
+
+
+
+def ring_flash_dummy(q, k, v, attn_bias, axis_name, float32_logits, blockwise_kwargs):
+    from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention, BlockSizes, mha_reference
+    if float32_logits:
+        q, k = q.astype(jnp.float32), k.astype(jnp.float32)
+    q, k, v = map(lambda x: rearrange(x, 'b q h d -> b h q d'), [q, k, v])
+    attn_bias = attn_bias[:, 0, 0] # (batch, q_len)
+
+    query_chunk_size = blockwise_kwargs["query_chunk_size"]
+    key_chunk_size = blockwise_kwargs["key_chunk_size"]
+
+    block_sizes = BlockSizes(
+        block_q=query_chunk_size,
+        block_k_major=key_chunk_size,
+        block_k=key_chunk_size,
+        block_b=1,
+        block_q_major_dkv=query_chunk_size,
+        block_k_major_dkv=key_chunk_size,
+        block_k_dkv=key_chunk_size,
+        block_q_dkv=query_chunk_size,
+        block_k_major_dq=key_chunk_size,
+        block_k_dq=key_chunk_size,
+        block_q_dq=query_chunk_size,
+    )
+
+    o = flash_attention(
+        q, k, v,
+        causal=blockwise_kwargs["causal"],
+        block_sizes=block_sizes,
+        sm_scale=q.shape[-1] ** -0.5,
+    )
+    output = rearrange(o.astype(v.dtype), 'b h q d -> b q h d')
+    return output
+
+
+def ring_standard_dummy(q, k, v, attn_bias, axis_name, float32_logits, blockwise_kwargs):
+    from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention, BlockSizes, mha_reference
+    if float32_logits:
+        q, k = q.astype(jnp.float32), k.astype(jnp.float32)
+    q, k, v = map(lambda x: rearrange(x, 'b q h d -> b h q d'), [q, k, v])
+    attn_bias = attn_bias[:, 0, 0] # (batch, q_len)
+
+    o = mha_reference(
+        q, k, v,
+        ab=None,
+        causal=blockwise_kwargs["causal"],
+        sm_scale=q.shape[-1] ** -0.5,
+    )
+    output = rearrange(o.astype(v.dtype), 'b h q d -> b q h d')
+    return output
+
+
+def _ring_flash_attention_fwd_tpu(q, k, v, attn_bias, axis_name, float32_logits, blockwise_kwargs):
+    if float32_logits:
+        q, k = q.astype(jnp.float32), k.astype(jnp.float32)
+    q, k, v = map(lambda x: rearrange(x, 'b q h d -> b h q d'), [q, k, v])
+    batch, num_heads, q_len, dim_per_head = q.shape
+    batch, num_heads, kv_len, dim_per_head = k.shape
+    attn_bias = attn_bias[:, 0, 0] # (batch, q_len)
+
+    o = jnp.zeros((batch, num_heads, q_len, dim_per_head)).astype(q.dtype)
+    l = jnp.zeros((batch, num_heads, q_len)).astype(q.dtype)
+    m = jnp.full((batch, num_heads, q_len), -jnp.inf).astype(q.dtype)
+
+    axis_size = lax.psum(1, axis_name)
+    block_size = q_len # assumes this function is pre-sharded inside shard_map
+    query_chunk_size = blockwise_kwargs["query_chunk_size"]
+    key_chunk_size = blockwise_kwargs["key_chunk_size"]
+
+    block_sizes = BlockSizes(
+        block_q=query_chunk_size,
+        block_k_major=key_chunk_size,
+        block_k=key_chunk_size,
+        block_b=1,
+        block_q_major_dkv=query_chunk_size,
+        block_k_major_dkv=key_chunk_size,
+        block_k_dkv=key_chunk_size,
+        block_q_dkv=query_chunk_size,
+        block_k_major_dq=key_chunk_size,
+        block_k_dq=key_chunk_size,
+        block_q_dq=query_chunk_size,
+    )
+
+    scale = q.shape[-1] ** -0.5
+    def scan_kv_block(carry, idx):
+        o, l, m, k, v = carry
+        # attn_bias_slice = lax.dynamic_slice_in_dim(attn_bias,
+        #     (lax.axis_index(axis_name) - idx) % axis_size * kv_len, kv_len, axis=-1
+        # )
+        attn_bias_slice = None # TODO
+        q_block_idx = lax.axis_index(axis_name)
+        k_block_idx = (lax.axis_index(axis_name) - idx) % axis_size
+        q_chunk_idx_start = q_block_idx * (block_size // query_chunk_size)
+        k_chunk_idx_start = k_block_idx * (block_size // key_chunk_size)
+        o, l, m = _flash_attention_fwd(
+            q, k, v,
+            carry=(o, l, m),
+            q_chunk_idx_start=q_chunk_idx_start,
+            k_chunk_idx_start=k_chunk_idx_start,
+            ab=attn_bias_slice,
+            segment_ids=None,
+            save_residuals=False,
+            causal=blockwise_kwargs["causal"],
+            sm_scale=scale,
+            block_sizes=block_sizes,
+            debug=False
+        )
+        k, v = map(lambda x: lax.ppermute(x, axis_name, perm=[(i, (i + 1) % axis_size) for i in range(axis_size)]), (k, v))
+        return (o, l, m, k, v), None
+    (o, l, m, _, _), _ = lax.scan(scan_kv_block,
+        init=(o, l, m, k, v), xs=jnp.arange(0, axis_size))
+    output = rearrange(o.astype(v.dtype), 'b h q d -> b q h d')
+    return output, (o, q, k, v, attn_bias, l, m)
+
+def _ring_flash_attention_bwd_tpu(axis_name, float32_logits, blockwise_kwargs, res, g):
+    del float32_logits
+    o, q, k, v, attn_bias, l, m = res
+    batch, num_heads, kv_len, dim_per_head = k.shape
+    axis_size = lax.psum(1, axis_name)
+    dq = jnp.zeros_like(q, dtype=jnp.float32)
+    dk = jnp.zeros_like(k, dtype=jnp.float32)
+    dv = jnp.zeros_like(v, dtype=jnp.float32)
+    query_chunk_size = blockwise_kwargs["query_chunk_size"]
+    key_chunk_size = blockwise_kwargs["key_chunk_size"]
+    block_size = q.shape[2] # assumes this function is pre-sharded inside shard_map
+    scale = q.shape[-1] ** -0.5
+
+    g = rearrange(g, 'b q h d -> b h q d')
+
+    block_sizes = BlockSizes(
+        block_q=query_chunk_size,
+        block_k_major=key_chunk_size,
+        block_k=key_chunk_size,
+        block_b=1,
+        block_q_major_dkv=query_chunk_size,
+        block_k_major_dkv=key_chunk_size,
+        block_k_dkv=key_chunk_size,
+        block_q_dkv=query_chunk_size,
+        block_k_major_dq=key_chunk_size,
+        block_k_dq=key_chunk_size,
+        block_q_dq=query_chunk_size,
+    )
+
+    def scan_kv_block(carry, idx):
+        dq, dk, dv, k, v = carry
+        # attn_bias_slice = lax.dynamic_slice_in_dim(attn_bias,
+        #     (lax.axis_index(axis_name) - idx) % axis_size * kv_len, kv_len, axis=-1
+        # )
+        attn_bias_slice = None # TODO
+        q_block_idx = lax.axis_index(axis_name)
+        k_block_idx = (lax.axis_index(axis_name) - idx) % axis_size
+        q_chunk_idx_start = q_block_idx * (block_size // query_chunk_size)
+        k_chunk_idx_start = k_block_idx * (block_size // key_chunk_size)
+        dq_i, dk_i, dv_i, = _flash_attention_bwd(
+            save_residuals=False,
+            causal=blockwise_kwargs["causal"],
+            sm_scale=scale,
+            block_sizes=block_sizes,
+            debug=False,
+            q_chunk_idx_start=q_chunk_idx_start,
+            k_chunk_idx_start=k_chunk_idx_start,
+            residuals=(q, k, v, attn_bias_slice, None, o, l, m),
+            do=g
+        )
+        dq += dq_i
+        dk += dk_i
+        dv += dv_i
+        k, v, dk, dv = map(lambda x: lax.ppermute(x, axis_name, perm=[(i,
+            (i + 1) % axis_size) for i in range(axis_size)]), (k, v, dk, dv))
+        return (dq, dk, dv, k, v), None
+    (dq, dk, dv, k, v), _ = lax.scan(scan_kv_block, init=(dq, dk, dv, k, v), xs=jnp.arange(0, axis_size))
+    dq, dk, dv = dq.astype(q.dtype), dk.astype(k.dtype), dv.astype(v.dtype)
+    dq, dk, dv = map(lambda x: rearrange(x, 'b h q d -> b q h d'), (dq, dk, dv))
+    return dq, dk, dv, None
+
+@partial(jax.custom_vjp, nondiff_argnums=[4, 5, 6])
+def ring_flash_attention_tpu(q, k, v, attn_bias, axis_name, float32_logits, blockwise_kwargs):
+    y, _ = _ring_flash_attention_fwd_tpu(q, k, v, attn_bias, axis_name, float32_logits, blockwise_kwargs)
+    return y
+
+ring_flash_attention_tpu.defvjp(_ring_flash_attention_fwd_tpu, _ring_flash_attention_bwd_tpu)
+
+
+from llamabpt.flash_attention_gpu import _mha_forward, _mha_backward
+
+def ring_flash_dummy_gpu(q, k, v, attn_bias, axis_name, float32_logits, blockwise_kwargs):
+    if float32_logits:
+        q, k = q.astype(jnp.float32), k.astype(jnp.float32)
+    attn_bias = attn_bias[:, 0, 0] # (batch, q_len)
+
+    query_chunk_size = blockwise_kwargs["query_chunk_size"]
+    key_chunk_size = blockwise_kwargs["key_chunk_size"]
+
+    output = mha(q, k, v, None, sm_scale=q.shape[-1] ** -0.5)
+    return output
+
+
+def _ring_flash_attention_fwd_gpu(q, k, v, attn_bias, axis_name, float32_logits, blockwise_kwargs):
+    if float32_logits:
+        q, k = q.astype(jnp.float32), k.astype(jnp.float32)
+    batch, q_len, num_heads, dim_per_head = q.shape
+    batch, kv_len, num_heads, dim_per_head = k.shape
+    attn_bias = attn_bias[:, 0, 0] # (batch, q_len)
+
+    o = jnp.zeros((batch, q_len, num_heads, dim_per_head)).astype(jnp.bfloat16)
+    l = jnp.zeros((batch, num_heads, q_len)).astype(jnp.float32)
+    m = jnp.full((batch, num_heads, q_len), -jnp.inf).astype(jnp.float32)
+
+    axis_size = lax.psum(1, axis_name)
+    block_size = q_len # assumes this function is pre-sharded inside shard_map
+    query_chunk_size = blockwise_kwargs["query_chunk_size"]
+    key_chunk_size = blockwise_kwargs["key_chunk_size"]
+
+    scale = q.shape[-1] ** -0.5
+    def scan_kv_block(carry, idx):
+        o, l, m, k, v = carry
+        # attn_bias_slice = lax.dynamic_slice_in_dim(attn_bias,
+        #     (lax.axis_index(axis_name) - idx) % axis_size * kv_len, kv_len, axis=-1
+        # )
+        attn_bias_slice = None # TODO
+        q_block_idx = lax.axis_index(axis_name)
+        k_block_idx = (lax.axis_index(axis_name) - idx) % axis_size
+        q_chunk_idx_start = q_block_idx * (block_size // query_chunk_size)
+        k_chunk_idx_start = k_block_idx * (block_size // key_chunk_size)
+        o, l, m = _mha_forward(
+            q, k, v,
+            carry=(o.astype(jnp.float32), l, m),
+            q_chunk_idx_start=q_chunk_idx_start, # TODO handle this
+            k_chunk_idx_start=k_chunk_idx_start,
+            segment_ids=None,
+            sm_scale=scale,
+            causal=blockwise_kwargs["causal"],
+            block_q=query_chunk_size,
+            block_k=key_chunk_size,
+            backward_pass_impl='triton', # unused
+            num_warps=None,
+            num_stages=2, # unused
+            grid=None,
+            interpret=False,
+            debug=False
+        )
+        k, v = map(lambda x: lax.ppermute(x, axis_name, perm=[(i, (i + 1) % axis_size) for i in range(axis_size)]), (k, v))
+        return (o, l, m, k, v), None
+    (o, l, m, _, _), _ = lax.scan(scan_kv_block,
+        init=(o, l, m, k, v), xs=jnp.arange(0, axis_size))
+    output = o.astype(v.dtype)
+    return output, (o, q, k, v, attn_bias, l, m)
+
+
+from jax.experimental.pallas.ops.attention import _mha_forward as _mha_forward_d, _mha_backward as _mha_backward_d, mha
+def _ring_flash_attention_bwd_gpu(axis_name, float32_logits, blockwise_kwargs, res, g):
+    del float32_logits
+    o, q, k, v, attn_bias, l, m = res
+    batch, kv_len, num_heads, dim_per_head = k.shape
+    axis_size = lax.psum(1, axis_name)
+    dq = jnp.zeros_like(q, dtype=q.dtype)
+    dk = jnp.zeros_like(k, dtype=k.dtype)
+    dv = jnp.zeros_like(v, dtype=v.dtype)
+    query_chunk_size = blockwise_kwargs["query_chunk_size"]
+    key_chunk_size = blockwise_kwargs["key_chunk_size"]
+    block_size = q.shape[2] # assumes this function is pre-sharded inside shard_map
+    scale = q.shape[-1] ** -0.5
+
+    def scan_kv_block(carry, idx):
+        dq, dk, dv, k, v = carry
+        # attn_bias_slice = lax.dynamic_slice_in_dim(attn_bias,
+        #     (lax.axis_index(axis_name) - idx) % axis_size * kv_len, kv_len, axis=-1
+        # )
+        attn_bias_slice = None # TODO
+        q_block_idx = lax.axis_index(axis_name)
+        k_block_idx = (lax.axis_index(axis_name) - idx) % axis_size
+        q_chunk_idx_start = q_block_idx * (block_size // query_chunk_size)
+        k_chunk_idx_start = k_block_idx * (block_size // key_chunk_size)
+        dq_i, dk_i, dv_i = _mha_backward(
+            sm_scale=scale,
+            causal=blockwise_kwargs["causal"],
+            block_q=query_chunk_size,
+            block_k=key_chunk_size,
+            backward_pass_impl='triton',
+            num_warps=None,
+            num_stages=2,
+            grid=None,
+            interpret=False,
+            debug=False,
+            q_chunk_idx_start=q_chunk_idx_start,
+            k_chunk_idx_start=k_chunk_idx_start,
+            res=(q, k, v, None, o, l, m),
+            do=g,
+        )
+        dq += dq_i
+        dk += dk_i
+        dv += dv_i
+        k, v, dk, dv = map(lambda x: lax.ppermute(x, axis_name, perm=[(i,
+            (i + 1) % axis_size) for i in range(axis_size)]), (k, v, dk, dv))
+        return (dq, dk, dv, k, v), None
+    (dq, dk, dv, k, v), _ = lax.scan(scan_kv_block, init=(dq, dk, dv, k, v), xs=jnp.arange(0, axis_size))
+    dq, dk, dv = dq.astype(q.dtype), dk.astype(k.dtype), dv.astype(v.dtype)
+    return dq, dk, dv, None
+
+@partial(jax.custom_vjp, nondiff_argnums=[4, 5, 6])
+def ring_flash_attention_gpu(q, k, v, attn_bias, axis_name, float32_logits, blockwise_kwargs):
+    y, _ = _ring_flash_attention_fwd_gpu(q, k, v, attn_bias, axis_name, float32_logits, blockwise_kwargs)
+    return y
+
+ring_flash_attention_gpu.defvjp(_ring_flash_attention_fwd_gpu, _ring_flash_attention_bwd_gpu)
 
 
 if __name__ == '__main__':

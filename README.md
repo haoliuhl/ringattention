@@ -1,22 +1,21 @@
-# Ring Attention with Blockwise Transformers for Near-Infinite Context
+## Ring Attention with Blockwise Transformers for Near-Infinite Context
 
 Hao Liu, Matei Zaharia, Pieter Abbeel
 
 Paper: https://arxiv.org/abs/2310.01889
 
-# Blockwise Parallel Transformer for Large Context Models
+## Blockwise Parallel Transformer for Large Context Models
 
 Hao Liu, Pieter Abbeel
 
 Paper: https://arxiv.org/abs/2305.19370
 
-This is the implementation of the Ring Attention. The model is described in the paper [Ring Attention with Blockwise Transformers for Near-Infinite Context](https://arxiv.org/pdf/2310.01889.pdf).
+---
+This codebase provides the implementation of the Ring Attention with Blockwise Transformers. The model is described in the paper [Ring Attention with Blockwise Transformers for Near-Infinite Context](https://arxiv.org/pdf/2310.01889.pdf) and [Blockwise Parallel Transformer for Large Context Models](https://arxiv.org/pdf/2305.19370.pdf).
 
-This implementation supports both Ring Attention and Blockwise Parallel Transformer (BPT). The BPT model is described in the paper [Blockwise Parallel Transformer for Large Context Models](https://arxiv.org/pdf/2305.19370.pdf).
+Blockwise Parallel Transformers (BPT) compute attention and feedforward in a blockwise manner, allowing for the training and inference of sequences up to four times longer than those manageable by standard memory-efficient attention methods, such as flash attention.
 
-BPT computes attention and feedforward in a blockwise manner, allowing training four times longer sequences than standard memory efficient attention.
-
-Ring Attention generalizes blockwise attention and distributes the attention computation across multiple devices, allowing up to number of devices times longer sequences than BPT.
+Ring Attention with Blockwise Parallel Transformers enables training sequences up to a length of 'number of devices' times longer than those possible with BPT. This is achieved by distributing the attention and feedforward computation across multiple devices and overlapping the communication with computation. Thanks to the blockwise computing of the attention and feedforward network, it is possible to train with tens of millions of tokens in context size without adding any communication or computation overhead.
 
 
 ## Requirements

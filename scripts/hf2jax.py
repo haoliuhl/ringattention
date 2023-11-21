@@ -174,8 +174,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model_size",
         type=str,
-        default="7b",
-        choices=["7b", "13b", "30b", "65b"],
+        default="3b",
+        choices=["3b", "7b", "13b", "30b", "65b"],
         help="model size",
     )
     parser.add_argument(
