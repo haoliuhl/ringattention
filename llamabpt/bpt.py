@@ -758,7 +758,7 @@ def _ring_flash_attention_bwd_gpu(axis_name, float32_logits, blockwise_kwargs, r
     dv = jnp.zeros_like(v, dtype=v.dtype)
     query_chunk_size = blockwise_kwargs["query_chunk_size"]
     key_chunk_size = blockwise_kwargs["key_chunk_size"]
-    block_size = q.shape[2] # assumes this function is pre-sharded inside shard_map
+    block_size = q.shape[1] # assumes this function is pre-sharded inside shard_map
     scale = q.shape[-1] ** -0.5
 
     def scan_kv_block(carry, idx):
