@@ -4,9 +4,11 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import json
 import tempfile
 from functools import partial
+import math
 
 import numpy as np
 import jax
+from jax.lib import xla_bridge
 import jax.numpy as jnp
 from jax import lax
 from jax.sharding import PartitionSpec as PS
@@ -30,7 +32,8 @@ from transformers.utils import add_start_docstrings, add_start_docstrings_to_mod
 from ml_collections import ConfigDict
 from ml_collections.config_dict import config_dict
 from tux import function_args_to_config, load_pickle, open_file,  with_sharding_constraint, get_jax_mesh, get_gradient_checkpoint_policy
-from bpt import blockwise_ffn, blockwise_attn, ring_attention
+from llamabpt.bpt import blockwise_ffn, ring_flash_attention_tpu, ring_flash_attention_gpu, \
+    ring_attention_standard, ring_attention
 
 
 LLAMA_STANDARD_CONFIGS = {
@@ -64,7 +67,7 @@ LLAMA_STANDARD_CONFIGS = {
         'intermediate_size': 11008,
         'num_hidden_layers': 32,
         'num_attention_heads': 32,
-        'max_sequence_length': 2048,
+        'max_sequence_length': 4096,
         'initializer_range': 0.02,
         'rms_norm_eps': 1e-6,
         'use_cache': True,
@@ -108,10 +111,10 @@ LLAMA_STANDARD_CONFIGS = {
     },
     'debug': { # A small model for debugging
         'vocab_size': 32000,
-        'hidden_size': 128,
+        'hidden_size': 256,
         'intermediate_size': 256,
         'num_hidden_layers': 2,
-        'num_attention_heads': 4,
+        'num_attention_heads': 2,
         'max_sequence_length': 2048,
         'initializer_range': 0.02,
         'rms_norm_eps': 1e-6,
@@ -172,7 +175,8 @@ class LLaMAConfig(PretrainedConfig):
         intermediate_size=11008,
         num_hidden_layers=32,
         num_attention_heads=32,
-        max_sequence_length=2048,
+        max_sequence_length=4096,
+        orig_sequence_length=4096,
         rms_norm_eps=1e-6,
         initializer_range=0.02,
         use_cache=True,
@@ -186,7 +190,6 @@ class LLaMAConfig(PretrainedConfig):
         remat_attention='',
         remat_mlp='',
         scan_attention=False,
-        attention_type=None,
         scan_mlp=False,
         scan_query_chunk_size=1024,
         scan_key_chunk_size=1024,
@@ -196,6 +199,9 @@ class LLaMAConfig(PretrainedConfig):
         scan_layers=True,
         param_scan_axis=0,
         mesh_dim=None,
+        use_flash_attention=True,
+        pos_interpolation='linear',
+        theta=10000,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -205,6 +211,7 @@ class LLaMAConfig(PretrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
         self.max_sequence_length = max_sequence_length
+        self.orig_sequence_length = orig_sequence_length
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
         self.resid_pdrop = resid_pdrop
@@ -214,7 +221,6 @@ class LLaMAConfig(PretrainedConfig):
         self.remat_attention = remat_attention
         self.remat_mlp = remat_mlp
         self.scan_attention = scan_attention
-        self.attention_type = attention_type
         self.scan_mlp = scan_mlp
         self.scan_query_chunk_size = scan_query_chunk_size
         self.scan_key_chunk_size = scan_key_chunk_size
@@ -224,6 +230,9 @@ class LLaMAConfig(PretrainedConfig):
         self.scan_layers = scan_layers
         self.param_scan_axis = param_scan_axis
         self.mesh_dim = mesh_dim
+        self.use_flash_attention = use_flash_attention
+        self.pos_interpolation = pos_interpolation
+        self.theta = theta
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
@@ -243,6 +252,22 @@ class LLaMAConfig(PretrainedConfig):
     @staticmethod
     def get_jax_mesh(axis_dims):
         return get_jax_mesh(axis_dims, ('dp', 'fsdp', 'tp', 'sp'))
+
+    @staticmethod
+    def get_ranks_and_size(mesh):
+        out = dict(mesh=mesh)
+        mp_size = mesh.shape['tp'] * mesh.shape['sp']
+        mp_node_size = max(1, mp_size // jax.local_device_count())
+        dp_node_size = jax.process_count() // mp_node_size
+        out.update(mp_node_size=mp_node_size,
+                   dp_node_size=dp_node_size)
+
+        dp_node_rank = jax.process_index() // mp_node_size
+        mp_node_rank = jax.process_index() % mp_node_size
+        out.update(dp_node_rank=dp_node_rank,
+                   mp_node_rank=mp_node_rank)
+        return out
+
 
     @staticmethod
     def get_partition_rules(scan_layers=False, scan_axis=0):
@@ -387,11 +412,62 @@ class RMSNorm(nn.Module):
         weight = jnp.asarray(self.weight, self.dtype)
         return output * weight
 
-def precompute_freqs_cis(dim: int, end: int, theta: float=10000.0, dtype: jnp.dtype=jnp.float32) -> jnp.ndarray:
+
+def precompute_freqs_cis_standard(dim: int, max_position_embedding: int, original_max_position_embeddings: int, theta: float=10000.0, dtype: jnp.dtype=jnp.float32) -> jnp.ndarray:
     freqs = 1.0 / (theta ** (np.arange(0, dim, 2)[: (dim // 2)].astype(dtype) / dim))
-    t = np.arange(end)  # type: ignore
+    t = np.arange(max_position_embedding) # type: ignore
     freqs = np.outer(t, freqs).astype(dtype)  # type: ignore
     sin, cos = np.sin(freqs), np.cos(freqs)
+    freqs_cis = np.complex64(cos + 1j * sin)
+    return jnp.asarray(freqs_cis)
+
+
+def precompute_freqs_cis_linear(dim: int, max_position_embedding: int, original_max_position_embeddings: int, theta: float=10000.0, dtype: jnp.dtype=jnp.float32) -> jnp.ndarray:
+    condensation_ratio = max_position_embedding / original_max_position_embeddings
+    freqs = 1.0 / (theta ** (np.arange(0, dim, 2)[: (dim // 2)].astype(dtype) / dim))
+    t = np.arange(max_position_embedding) / condensation_ratio  # type: ignore
+    freqs = np.outer(t, freqs).astype(dtype)  # type: ignore
+    sin, cos = np.sin(freqs), np.cos(freqs)
+    freqs_cis = np.complex64(cos + 1j * sin)
+    return jnp.asarray(freqs_cis)
+
+def precompute_freqs_cis_yarn(
+    dim: int, max_position_embeddings: int, original_max_position_embeddings: int, theta: float=10000.0, dtype: jnp.dtype=jnp.float32,
+    beta_fast=32, beta_slow=1, extrapolation_factor=1, attn_factor=1
+) -> jnp.ndarray:
+    condensation_ratio = max_position_embeddings / original_max_position_embeddings
+    pos_freqs = theta ** (np.arange(0, dim, 2).astype(dtype)[: (dim // 2)] / dim)
+    inv_freq_extrapolation = 1.0 / pos_freqs
+    inv_freq_interpolation = 1.0 / (condensation_ratio * pos_freqs)
+
+    def _yarn_find_correction_dim(num_rotations, max_position_embeddings):
+        return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (2 * math.log(theta))
+
+    def _yarn_find_correction_range(low_rot, high_rot, max_position_embeddings):
+        low = math.floor(_yarn_find_correction_dim(low_rot, max_position_embeddings))
+        high = math.ceil(_yarn_find_correction_dim(high_rot, max_position_embeddings))
+        return max(low, 0), min(high, dim - 1)
+
+    def _yarn_linear_ramp_mask(min, max, dim):
+        if min == max:
+            max += 0.001
+        linear_func = (np.arange(dim, dtype=np.float32) - min) / (max - min)
+        ramp_func = np.clip(linear_func, 0, 1)
+        return ramp_func
+
+    low, high = _yarn_find_correction_range(beta_fast, beta_slow, original_max_position_embeddings)
+    inv_freq_mask = (1 - _yarn_linear_ramp_mask(low, high, dim // 2).astype(np.float32)) * extrapolation_factor
+    inv_freq = inv_freq_interpolation * (1 - inv_freq_mask) + inv_freq_extrapolation * inv_freq_mask
+
+    def _yarn_get_mscale(scale=1):
+        if scale <= 1:
+            return 1.0
+        return 0.1 * math.log(scale) + 1.0
+    mscale = float(_yarn_get_mscale(condensation_ratio) * attn_factor)
+
+    t = np.arange(max_position_embeddings)
+    freqs = np.outer(t, inv_freq).astype(dtype)
+    sin, cos = np.sin(freqs) * mscale, np.cos(freqs) * mscale
     freqs_cis = np.complex64(cos + 1j * sin)
     return jnp.asarray(freqs_cis)
 
@@ -469,9 +545,19 @@ class FlaxLLaMAAttention(nn.Module):
 
         self.causal_mask = make_causal_mask(jnp.ones((1, config.max_sequence_length), dtype="bool"), dtype="bool")
 
-        self.freqs_cis = precompute_freqs_cis(
+        if self.config.pos_interpolation == 'linear':
+            precompute_freqs_cis_fn  = precompute_freqs_cis_linear
+        elif self.config.pos_interpolation == 'yarn':
+            precompute_freqs_cis_fn = precompute_freqs_cis_yarn
+        elif self.config.pos_interpolation == 'standard':
+            precompute_freqs_cis_fn = precompute_freqs_cis_standard
+        else:
+            raise Exception(self.config.pos_interpolation)
+        self.freqs_cis = precompute_freqs_cis_fn(
             self.head_dim,
-            config.max_sequence_length * 2,
+            config.max_sequence_length,
+            config.orig_sequence_length,
+            theta=config.theta,
             dtype=self.dtype,
         )
 
@@ -541,14 +627,11 @@ class FlaxLLaMAAttention(nn.Module):
         if not deterministic and self.config.attn_pdrop > 0.0:
             dropout_rng = self.make_rng("dropout")
 
-        # if self.config.scan_attention and not (self.has_variable("cache", "cached_key") or init_cache):
-        if self.config.attention_type in ['ring_blockwise', 'blockwise']:
+        if self.config.scan_attention and not (self.has_variable("cache", "cached_key") or init_cache):
             # doesn't need blockwise attention if we are doing autoregressive decoding since no quadratic memory
 
             # attention mask without nxn materlization, blockwise_attn will handle the rest
             attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-
-            attn_weights = None
 
             # transform boolean mask into float mask
             attention_bias = lax.select(
@@ -558,54 +641,48 @@ class FlaxLLaMAAttention(nn.Module):
             )
             attn_weights = None
 
-            if self.config.attention_type == 'ring_blockwise':
-                ring_attention_sharded = shard_map(
-                    partial(
-                        ring_attention,
-                        axis_name="sp",
-                        float32_logits=True,
-                        blockwise_kwargs=dict(
-                            deterministic=deterministic,
-                            dropout_rng=dropout_rng,
-                            attn_pdrop=self.config.attn_pdrop,
-                            causal=True,
-                            query_chunk_size=self.config.scan_query_chunk_size,
-                            key_chunk_size=self.config.scan_key_chunk_size,
-                            dtype=self.dtype,
-                            policy=get_gradient_checkpoint_policy('nothing_saveable'),
-                            precision=self.precision,
-                            prevent_cse=not self.config.scan_layers,
-                        )
-                    ),
-                    mesh=LLaMAConfig.get_jax_mesh(self.config.mesh_dim),
-                    in_specs=(
-                        PS(("dp", "fsdp"), "sp", "tp", None),
-                        PS(("dp", "fsdp"), "sp", "tp", None),
-                        PS(("dp", "fsdp"), "sp", "tp", None),
-                        PS(("dp", "fsdp"), None, None, None)
-                    ),
-                    out_specs=PS(("dp", "fsdp"), "sp", "tp", None),
-                    check_rep=False
-                )
-                attn_output = ring_attention_sharded(xq, xk, xv, attention_bias)
-            elif self.config.attention_type == 'blockwise':
-                attn_output = blockwise_attn(
-                    xq, xk, xv, attention_bias,
-                    deterministic=deterministic,
-                    dropout_rng=dropout_rng,
-                    attn_pdrop=self.config.attn_pdrop,
-                    causal=True,
-                    query_chunk_size=self.config.scan_query_chunk_size,
-                    key_chunk_size=self.config.scan_key_chunk_size,
-                    dtype=self.dtype,
-                    policy=get_gradient_checkpoint_policy('nothing_saveable'),
-                    precision=self.precision,
-                    float32_logits=True,
-                    prevent_cse=not self.config.scan_layers,
-                )
+            if self.config.use_flash_attention:
+                platform = xla_bridge.get_backend().platform
+                if platform == "gpu":
+                    float32_logits = False # not supported on GPU
+                    ring_attention_fn = ring_flash_attention_gpu
+                elif platform == "tpu":
+                    float32_logits = True
+                    ring_attention_fn = ring_flash_attention_tpu
+                else:
+                    raise ValueError(f"Unsupported platform {platform}")
             else:
-                raise Exception(self.config.attention_type)
-
+                float32_logits = True
+                ring_attention_fn = ring_attention # uses BPT attention
+            ring_attention_sharded = shard_map(
+                partial(
+                    ring_attention_fn,
+                    axis_name="sp",
+                    float32_logits=float32_logits,
+                    blockwise_kwargs=dict(
+                        deterministic=deterministic,
+                        dropout_rng=dropout_rng,
+                        attn_pdrop=self.config.attn_pdrop,
+                        causal=True,
+                        query_chunk_size=self.config.scan_query_chunk_size,
+                        key_chunk_size=self.config.scan_key_chunk_size,
+                        dtype=self.dtype,
+                        policy=get_gradient_checkpoint_policy('nothing_saveable'),
+                        precision=self.precision,
+                        prevent_cse=not self.config.scan_layers,
+                    )
+                ),
+                mesh=LLaMAConfig.get_jax_mesh(self.config.mesh_dim),
+                in_specs=(
+                    PS(("dp", "fsdp"), "sp", "tp", None),
+                    PS(("dp", "fsdp"), "sp", "tp", None),
+                    PS(("dp", "fsdp"), "sp", "tp", None),
+                    PS(("dp", "fsdp"), None, None, None)
+                ),
+                out_specs=PS(("dp", "fsdp"), "sp", "tp", None),
+                check_rep=False
+            )
+            attn_output = ring_attention_sharded(xq, xk, xv, attention_bias)
             attn_output = with_sharding_constraint(attn_output, PS(("dp", "fsdp"), "sp", "tp", None))
         else:
             query_length, key_length = xq.shape[1], xk.shape[1]
@@ -630,26 +707,21 @@ class FlaxLLaMAAttention(nn.Module):
             if self.has_variable("cache", "cached_key") or init_cache:
                 xk, xv, attention_mask = self._concatenate_to_cache(xk, xv, xq, attention_mask)
 
-            if self.config.attention_type == 'standard':
-                attention_bias = lax.select(
-                    attention_mask > 0,
-                    jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-                    jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
-                )
-                attn_weights = dot_product_attention_weights(
-                    xq,
-                    xk,
-                    bias=attention_bias,
-                    dropout_rng=dropout_rng,
-                    dropout_rate=self.config.attn_pdrop,
-                    deterministic=deterministic,
-                    dtype=jnp.promote_types(self.dtype, jnp.float32),
-                    precision=self.precision,
-                )
-                attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "tp", "sp", None))
-                attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, xv, precision=self.precision)
-            else:
-                raise Exception(self.config.attention_type)
+            attn_weights = None
+            ring_attention_sharded = shard_map(
+                partial(ring_attention_standard, axis_name="sp"), mesh=LLaMAConfig.get_jax_mesh(self.config.mesh_dim),
+                in_specs=(
+                    PS(("dp", "fsdp"), "sp", "tp", None),
+                    PS(("dp", "fsdp"), "sp", "tp", None),
+                    PS(("dp", "fsdp"), "sp", "tp", None),
+                    PS(("dp", "fsdp"), None, "sp", None)
+                ),
+                out_specs=PS(("dp", "fsdp"), "sp", "tp", None),
+                check_rep=False
+            )
+            attn_output = ring_attention_sharded(
+                xq, xk, xv, attention_mask
+            )
 
         attn_output = self._merge_heads(attn_output)
         attn_output = self.wo(attn_output)
