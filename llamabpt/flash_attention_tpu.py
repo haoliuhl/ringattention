@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Flash Attention TPU kernel."""
+"""Module containing fused attention forward and backward pass."""
 from __future__ import annotations
 
 import dataclasses

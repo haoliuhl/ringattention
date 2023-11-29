@@ -32,7 +32,7 @@ from transformers.utils import add_start_docstrings, add_start_docstrings_to_mod
 from ml_collections import ConfigDict
 from ml_collections.config_dict import config_dict
 from tux import function_args_to_config, load_pickle, open_file,  with_sharding_constraint, get_jax_mesh, get_gradient_checkpoint_policy
-from llamabpt.bpt import blockwise_ffn, ring_flash_attention_tpu, ring_flash_attention_gpu, \
+from llamabpt.ring_attention import blockwise_ffn, ring_flash_attention_tpu, ring_flash_attention_gpu, \
     ring_attention_standard, ring_attention
 
 

@@ -1,3 +1,11 @@
+"""This module contains ring attention forward and backward pass,
+supporting both fused and blockwise attention.
+It features blockwise computation for feedforward networks,
+which can be integrated with ring attention. For more details,
+refer to 'Ring Attention' at https://arxiv.org/abs/2305.19370 and
+'Blockwise Parallel Transformers' at https://arxiv.org/abs/2310.01889.
+"""
+
 import numpy as np
 import flax.linen as nn
 import jax
@@ -8,9 +16,6 @@ from functools import partial
 from llamabpt.flash_attention_tpu import _flash_attention_fwd, _flash_attention_bwd, BlockSizes
 
 
-"""
-Ring Attention with (a) scan and (b) pallas
-"""
 def _ring_attention_fwd(q, k, v, attn_bias, axis_name, float32_logits, blockwise_kwargs):
     if float32_logits:
         q, k = q.astype(jnp.float32), k.astype(jnp.float32)
