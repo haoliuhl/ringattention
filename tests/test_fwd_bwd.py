@@ -9,7 +9,7 @@ from jax.experimental.pjit import pjit
 from jax.sharding import PartitionSpec as PS
 from flax.training.train_state import TrainState
 
-from llamabpt.data import DatasetFactory
+from bpt.data import DatasetFactory
 from tux import (
     JaxRNG, JaxDistributedConfig, next_rng, init_rng, match_partition_rules,
     cross_entropy_loss_and_accuracy, global_norm, get_float_dtype_by_name,
@@ -17,7 +17,7 @@ from tux import (
     make_shard_and_gather_fns, with_sharding_constraint, define_flags_with_default,
     OptimizerFactory, StreamingCheckpointer
 )
-from llamabpt.llama import LLaMAConfig, FlaxLLaMAForCausalLMModule
+from bpt.llama import LLaMAConfig, FlaxLLaMAForCausalLMModule
 
 
 FLAGS, FLAGS_DEF = define_flags_with_default(

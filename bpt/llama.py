@@ -32,8 +32,7 @@ from transformers.utils import add_start_docstrings, add_start_docstrings_to_mod
 from ml_collections import ConfigDict
 from ml_collections.config_dict import config_dict
 from tux import function_args_to_config, load_pickle, open_file,  with_sharding_constraint, get_jax_mesh, get_gradient_checkpoint_policy
-from llamabpt.ring_attention import blockwise_ffn, ring_flash_attention_tpu, ring_flash_attention_gpu, \
-    ring_attention_standard, ring_attention
+from bpt.ring_attention import blockwise_ffn, ring_flash_attention_tpu, ring_attention_standard, ring_attention
 
 
 LLAMA_STANDARD_CONFIGS = {
@@ -641,24 +640,16 @@ class FlaxLLaMAAttention(nn.Module):
             )
             attn_weights = None
 
-            if self.config.use_flash_attention:
-                platform = xla_bridge.get_backend().platform
-                if platform == "gpu":
-                    float32_logits = False # not supported on GPU
-                    ring_attention_fn = ring_flash_attention_gpu
-                elif platform == "tpu":
-                    float32_logits = True
-                    ring_attention_fn = ring_flash_attention_tpu
-                else:
-                    raise ValueError(f"Unsupported platform {platform}")
+            platform = xla_bridge.get_backend().platform
+            if self.config.use_flash_attention and platform == "tpu":
+                ring_attention_fn = ring_flash_attention_tpu
             else:
-                float32_logits = True
                 ring_attention_fn = ring_attention # uses BPT attention
             ring_attention_sharded = shard_map(
                 partial(
                     ring_attention_fn,
                     axis_name="sp",
-                    float32_logits=float32_logits,
+                    float32_logits=True,
                     blockwise_kwargs=dict(
                         deterministic=deterministic,
                         dropout_rng=dropout_rng,

@@ -17,6 +17,8 @@ Blockwise Parallel Transformers (BPT) compute attention and feedforward in a blo
 
 Ring Attention with Blockwise Parallel Transformers enables training sequences up to a length of 'number of devices' times longer than those possible with BPT. This is achieved by distributing the attention and feedforward computation across multiple devices and overlapping the communication with computation. Thanks to the blockwise computing of the attention and feedforward network, it is possible to train with tens of millions of tokens in context size without adding any communication or computation overhead.
 
+This codebase is utilized to train the Large World Model (LWM) whose project page is [LWM project](https://largeworldmodel.github.io/) and codebase with features for million-length vision-language training is [LWM codebase](https://github.com/LargeWorldModel/LWM).
+
 
 ## Requirements
 Install the requirements with:
@@ -32,7 +34,7 @@ sh tpu_requirements.sh
 
 The code is organized as follows:
 - `scripts/` contains the requirements and scripts for preparing the data.
-- `llamabpt/` contains the example of applying BPT and RingAttention to LLaMA.
+- `bpt/` contains the example of applying BPT and RingAttention to LLaMA.
 
 The implementation optimized sharding annotations for distributed FSDP training. It also supports RingAttention, BPT, memeff/flashattention, and vanilla transformers.
 
@@ -59,7 +61,7 @@ Ring Attention use the last dimension of `mesh_dim` to control how many devices 
 An example of using BPT to train 13B LLaMA model with 32K context length and 2M batch size on TPU v4-512 is as follows:
 
 ```bash
-python3 -m llamabpt.train \
+python3 -m bpt.train \
     --mesh_dim='1,64,4,1' \
     --dtype='bf16' \
     --total_steps=480000 \
@@ -90,7 +92,7 @@ python3 -m llamabpt.train \
 Similarly, an example of using Ring Attention to train 13B LLaMA model with 2M context length and 2M batch size on TPU v4-512 is as follows:
 
 ```bash
-python3 -m llamabpt.train \
+python3 -m bpt.train \
     --mesh_dim='1,1,4,64' \
     --dtype='bf16' \
     --total_steps=480000 \
@@ -135,14 +137,7 @@ Then you can load the model using the `--load_checkpoint` flag:
 ```bash
 --load_checkpoint='params::/path/output'
 ```
-Note that only LLaMA-1 and its variants are supported for now, and set `scan_layers=False` for loading huggingface models.
 
-*Note for Ring Attention*: Ring Attention can train up to device count times longer sequences than previous bests (BPT, memeff, flashattention). However, the current implementation is not optimized for speed, since it uses Jax high level APIs. We recommend porting the code to Jax low level APIs such as Pallas or Triton to achieve optimal speed.
-
-*Note for BPT*: This code relies on compiler to fuse blockwise attention and ffn computation, while this is enough for cutting down the memory cost (BPT can train 4x longer than memeff / flashattention), it is not enough for achieving optimal speed up due to compiler limitation.
-The ideal way would be to fuse manually, which is not supported by the current code.
-
-The repo for the original BPT release is in the [initial release](https://github.com/lhao499/blockwise-parallel-transformer/tree/bpt_init_v1) branch.
 
 ## Reference
 If you find our work relevant to your research, please cite:
