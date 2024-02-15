@@ -1,4 +1,5 @@
 import pprint
+import os
 from functools import partial
 
 from tqdm import tqdm, trange
@@ -12,13 +13,12 @@ import jax.numpy as jnp
 from jax.experimental.pjit import pjit
 from jax.sharding import PartitionSpec as PS
 from flax.training.train_state import TrainState
-import flax
 
 from bpt.data import DatasetFactory
 from tux import (
     JaxRNG, JaxDistributedConfig, next_rng, match_partition_rules,
     cross_entropy_loss_and_accuracy, global_norm, get_float_dtype_by_name,
-    set_random_seed, average_metrics, get_weight_decay_mask,
+    set_random_seed, average_metrics, get_mask,
     make_shard_and_gather_fns, with_sharding_constraint, define_flags_with_default,
     OptimizerFactory, StreamingCheckpointer
 )
@@ -28,7 +28,7 @@ from bpt.llama import LLaMAConfig, FlaxLLaMAForCausalLMModule
 FLAGS, FLAGS_DEF = define_flags_with_default(
     seed=42,
     mesh_dim='1,-1,1,1',
-    dtype='bf16',
+    dtype='fp32',
     total_steps=10000,
     load_llama_config='',
     update_llama_config='',
@@ -62,13 +62,21 @@ def main(argv):
     )
     set_random_seed(FLAGS.seed)
 
-    tokenizer = LLaMAConfig.get_tokenizer(FLAGS.tokenizer)
+    if jax.process_index() == 0:
+        output_dir = logger.output_dir
+    else:
+        output_dir = os.path.join(logger.output_dir, logger.experiment_id)
+
+    config_cls = LLaMAConfig
+    llama_cls = FlaxLLaMAForCausalLMModule
+    mesh = config_cls.get_jax_mesh(FLAGS.mesh_dim)
+
+    tokenizer = config_cls.get_tokenizer(FLAGS.tokenizer)
     dataset = DatasetFactory.load_dataset(FLAGS.train_dataset, tokenizer)
-    if FLAGS.autoresume:
-        if tux.check_exists(logger.output_dir):
-            logging.info('Found existing output. Resuming dataset from latest checkpoint...')
-            resume_path = f"{logger.output_dir}/dataset.pkl"
-            dataset.load_state_dict(tux.load_pickle(resume_path))
+    if FLAGS.autoresume and tux.check_exists(output_dir):
+        logging.info('Found existing output. Resuming dataset from latest checkpoint...')
+        resume_path = f"{output_dir}/dataset.pkl"
+        dataset.load_state_dict(tux.load_pickle(resume_path))
     elif FLAGS.load_dataset_state != '':
         dataset.load_state_dict(tux.load_pickle(FLAGS.load_dataset_state))
 
@@ -81,8 +89,8 @@ def main(argv):
     seq_length = dataset.seq_length
 
     if FLAGS.load_llama_config != '':
-        llama_config = LLaMAConfig.load_config(FLAGS.load_llama_config)
-        updates = LLaMAConfig(**FLAGS.llama)
+        llama_config = config_cls.load_config(FLAGS.load_llama_config)
+        updates = config_cls(**FLAGS.llama)
         llama_config.update(dict(
             remat_block=updates.remat_block,
             remat_attention=updates.remat_attention,
@@ -96,7 +104,7 @@ def main(argv):
             param_scan_axis=updates.param_scan_axis,
         ))
     else:
-        llama_config = LLaMAConfig(**FLAGS.llama)
+        llama_config = config_cls(**FLAGS.llama)
 
     if FLAGS.update_llama_config != '':
         llama_config.update(dict(eval(FLAGS.update_llama_config)))
@@ -109,13 +117,14 @@ def main(argv):
         llama_config.update(dict(vocab_size=dataset.vocab_size))
     llama_config.update(dict(mesh_dim=FLAGS.mesh_dim))
 
-    model = FlaxLLaMAForCausalLMModule(
+    model = llama_cls(
         llama_config, dtype=get_float_dtype_by_name(FLAGS.dtype)
     )
 
     optimizer, optimizer_info = OptimizerFactory.get_optimizer(
         FLAGS.optimizer,
-        get_weight_decay_mask(LLaMAConfig.get_weight_decay_exclusions())
+        get_mask(config_cls.get_weight_decay_exclusions()),
+        None,
     )
 
     def create_trainstate_from_params(params):
@@ -137,21 +146,27 @@ def main(argv):
         batch = with_sharding_constraint(batch, PS(('dp', 'fsdp'), 'sp'))
         def loss_and_accuracy(params):
             logits = model.apply(
-                params, batch['input_tokens'], deterministic=False,
+                params,
+                batch['input_tokens'],
+                deterministic=False,
                 rngs=rng_generator(llama_config.rng_keys()),
             ).logits
-            return cross_entropy_loss_and_accuracy(
-                logits, batch['target_tokens'], batch['loss_masks']
+            loss, acc = cross_entropy_loss_and_accuracy(
+                logits,
+                batch['target_tokens'],
+                batch['loss_masks']
             )
+            metrics = dict(acc=acc)
+            return loss, metrics
         grad_fn = jax.value_and_grad(loss_and_accuracy, has_aux=True)
-        (loss, accuracy), grads = grad_fn(train_state.params)
+        (loss, loss_metrics), grads = grad_fn(train_state.params)
         train_state = train_state.apply_gradients(grads=grads)
         metrics = dict(
             loss=loss,
-            accuracy=accuracy,
             learning_rate=optimizer_info['learning_rate_schedule'](train_state.step),
-            gradient_norm=global_norm(grads),
             param_norm=global_norm(train_state.params),
+            gradient_norm=global_norm(grads),
+            **loss_metrics
         )
         return train_state, rng_generator(), metrics
 
@@ -159,21 +174,24 @@ def main(argv):
         rng_generator = JaxRNG(rng)
         batch = with_sharding_constraint(batch, PS(('dp', 'fsdp'), 'sp'))
         logits = model.apply(
-            train_state.params, batch['input_tokens'], deterministic=True,
+            train_state.params,
+            batch['input_tokens'],
+            deterministic=True,
             rngs=rng_generator(llama_config.rng_keys()),
         ).logits
-        loss, accuracy = cross_entropy_loss_and_accuracy(
-            logits, batch['target_tokens'], batch['loss_masks']
+        loss, acc = cross_entropy_loss_and_accuracy(
+            logits,
+            batch['target_tokens'],
+            batch['loss_masks']
         )
         metrics = dict(
             eval_loss=loss,
-            eval_accuracy=accuracy,
+            eval_acc=acc,
         )
-        return rng_generator(), metrics
 
     train_state_shapes = jax.eval_shape(init_fn, next_rng())
     train_state_partition = match_partition_rules(
-        LLaMAConfig.get_partition_rules(llama_config.scan_layers, llama_config.param_scan_axis), train_state_shapes
+        config_cls.get_partition_rules(llama_config.scan_layers, llama_config.param_scan_axis), train_state_shapes
     )
 
     shard_fns, gather_fns = make_shard_and_gather_fns(
@@ -197,9 +215,10 @@ def main(argv):
         donate_argnums=(0, ),
     )
 
+    batch_spec = PS()
     sharded_train_step = pjit(
         train_step,
-        in_shardings=(train_state_partition, PS(), PS()),
+        in_shardings=(train_state_partition, PS(), batch_spec),
         out_shardings=(train_state_partition, PS(), PS()),
         donate_argnums=(0, 1),
     )
@@ -227,20 +246,18 @@ def main(argv):
             milestone=milestone,
         )
 
-    mesh = LLaMAConfig.get_jax_mesh(FLAGS.mesh_dim)
     with mesh:
         train_state, restored_params = None, None
 
-        if FLAGS.autoresume:
-            if tux.check_exists(logger.output_dir):
-                logging.info('Found existing output. Resuming model from latest checkpoint...')
-                resume_path = f"trainstate::{logger.output_dir}/streaming_train_state"
-                train_state, restored_params = checkpointer.load_trainstate_checkpoint(
-                    resume_path, train_state_shapes, shard_fns
-                )
+        if FLAGS.autoresume and tux.check_exists(output_dir):
+            logging.info('Found existing output. Resuming model from latest checkpoint...')
+            resume_path = f"trainstate::{output_dir}/streaming_train_state"
+            train_state, restored_params = checkpointer.load_trainstate_checkpoint(
+                resume_path, train_state_shapes, shard_fns, max_buffer_size=32 * 2 ** 30
+            )
         elif FLAGS.load_checkpoint != '':
             train_state, restored_params = checkpointer.load_trainstate_checkpoint(
-                FLAGS.load_checkpoint, train_state_shapes, shard_fns
+                FLAGS.load_checkpoint, train_state_shapes, shard_fns, max_buffer_size=32 * 2 ** 30
             )
 
         if train_state is None and restored_params is None:
@@ -259,12 +276,10 @@ def main(argv):
         sharded_rng = next_rng()
 
         step_counter = trange(start_step, FLAGS.total_steps, ncols=0)
-
         for step, (batch, dataset_metrics) in zip(step_counter, dataset):
             train_state, sharded_rng, metrics = sharded_train_step(
                 train_state, sharded_rng, batch
             )
-
             if step % FLAGS.log_freq == 0:
                 if FLAGS.eval_steps > 0:
                     eval_metric_list = []
