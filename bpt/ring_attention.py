@@ -1,6 +1,6 @@
 """This module contains ring attention forward and backward pass, supporting both blockwise computation and TPU-compatible fused attention.
 It features blockwise computation for feedforward networks to reduce memory cost.
-For more details, refer to 'RingAttention' at https://arxiv.org/abs/2305.19370 and 'Blockwise Parallel Transformers' at https://arxiv.org/abs/2310.01889.
+For more details, refer to 'RingAttention' at https://arxiv.org/abs/2310.01889 and 'Blockwise Parallel Transformers' at https://arxiv.org/abs/2305.19370.
 """
 
 import numpy as np
