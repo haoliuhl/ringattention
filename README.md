@@ -138,6 +138,11 @@ Then you can load the model using the `--load_checkpoint` flag:
 --load_checkpoint='params::/path/output'
 ```
 
+### Documentation
+
+For more details on the codebase, please refer to the [data.md](docs/data.md) and [sharding.md](docs/sharding.md).
+The [data.md](docs/data.md) provides details on the data processing and the [sharding.md](docs/sharding.md) provides details on the sharding and parallelism.
+
 
 ## Reference
 If you find our work relevant to your research, please cite:

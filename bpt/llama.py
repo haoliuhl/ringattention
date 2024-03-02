@@ -28,7 +28,7 @@ from transformers.utils import add_start_docstrings, add_start_docstrings_to_mod
 
 from ml_collections import ConfigDict
 from tux import function_args_to_config, load_pickle, open_file,  with_sharding_constraint, get_jax_mesh, get_gradient_checkpoint_policy
-from lwm.ring_attention import blockwise_ffn, ring_flash_attention_tpu, \
+from bpt.ring_attention import blockwise_ffn, ring_flash_attention_tpu, \
     ring_attention_standard, ring_attention
 
 
@@ -163,7 +163,6 @@ class LLaMAConfig(PretrainedConfig):
         scan_layers=True,
         param_scan_axis=0,
         mesh_dim=None,
-        use_flash_attention=True,
         theta=10000,
         **kwargs,
     ):
@@ -190,7 +189,6 @@ class LLaMAConfig(PretrainedConfig):
         self.scan_layers = scan_layers
         self.param_scan_axis = param_scan_axis
         self.mesh_dim = mesh_dim
-        self.use_flash_attention = use_flash_attention
         self.theta = theta
         super().__init__(
             bos_token_id=bos_token_id,
@@ -230,11 +228,7 @@ class LLaMAConfig(PretrainedConfig):
 
     @staticmethod
     def get_partition_rules(scan_layers=False, scan_axis=0):
-        """ Parition rules for GPTJ. Note that these rules are orderd, so that
-            the beginning rules match first. It is important to use
-            PartitionSpec() instead of None here because JAX does not treat
-            None as a pytree leaf.
-        """
+        """Parition rules are orderd, so that the beginning rules match first."""
         if scan_layers:
             if scan_axis == 0:
                 return (
@@ -477,11 +471,6 @@ class FlaxLLaMAAttention(nn.Module):
 
     @nn.compact
     def _concatenate_to_cache(self, key, value, query, attention_mask):
-        """
-        This function takes projected key, value states from a single input token and concatenates the states to cached
-        states from previous steps. This function is slighly adapted from the official Flax repository:
-        https://github.com/google/flax/blob/491ce18759622506588784b4fca0e4bf05f8c8cd/flax/linen/attention.py#L252
-        """
         # detect if we're initializing by absence of existing cache data.
         is_initialized = self.has_variable("cache", "cached_key")
         cached_key = self.variable("cache", "cached_key", jnp.zeros, key.shape, key.dtype)
@@ -581,9 +570,11 @@ class FlaxLLaMAAttention(nn.Module):
             attn_weights = None
 
             platform = xla_bridge.get_backend().platform
-            if self.config.use_flash_attention and platform == "tpu":
+            if platform == "tpu":
+                logging.info(f"Using fused attention for {platform}")
                 ring_attention_fn = ring_flash_attention_tpu
             else:
+                logging.info(f"Fused attention is not yet supported for {platform}, using non-fused version")
                 ring_attention_fn = ring_attention # uses BPT attention
             ring_attention_sharded = shard_map(
                 partial(
@@ -919,7 +910,6 @@ class FlaxLLaMAPreTrainedModel(FlaxPreTrainedModel):
 
         inputs = {"params": params or self.params}
 
-        # if past_key_values are passed then cache is already initialized a private flag init_cache has to be passed down to ensure cache is used. It has to be made sure that cache is marked as mutable so that it can be changed by FlaxGPTJAttention module
         if past_key_values:
             inputs["cache"] = past_key_values
             mutable = ["cache"]
@@ -1038,7 +1028,6 @@ class FlaxLLaMABlockCollection(nn.Module):
                 if output_attentions:
                     all_attentions += (layer_outputs[1],)
 
-        # this contains possible `None` values - `FlaxGPTJModule` will filter them out
         outputs = (hidden_states, all_hidden_states, all_attentions)
 
         return outputs
@@ -1191,9 +1180,6 @@ class FlaxLLaMAForCausalLM(FlaxLLaMAPreTrainedModel):
         batch_size, seq_length = input_ids.shape
 
         past_key_values = self.init_cache(batch_size, max_length)
-        # Note that usually one would have to put 0's in the attention_mask for x > input_ids.shape[-1] and x < cache_length.
-        # But since GPTJ uses a causal mask, those positions are masked anyways.
-        # Thus we can create a single static attention_mask here, which is more efficient for compilation
         extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
         if attention_mask is not None:
             position_ids = attention_mask.cumsum(axis=-1) - 1
