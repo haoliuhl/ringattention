@@ -188,6 +188,7 @@ def main(argv):
             eval_loss=loss,
             eval_acc=acc,
         )
+        return rng_generator(), metrics
 
     train_state_shapes = jax.eval_shape(init_fn, next_rng())
     train_state_partition = match_partition_rules(
