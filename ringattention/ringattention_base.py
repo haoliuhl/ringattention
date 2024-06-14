@@ -5,6 +5,7 @@ For more details, refer to 'RingAttention' at https://arxiv.org/abs/2310.01889 a
 
 import numpy as np
 import flax.linen as nn
+from flax.linen import partitioning
 import jax
 import jax.lax as lax
 import jax.numpy as jnp
@@ -335,18 +336,23 @@ def below_or_on_diag(r, r_blk_size, c, c_blk_size, causal_block_size):
 
 
 # Blockwise feedforward network for memory-efficient training
-def blockwise_ffn(remat_ffn, inputs, chunk_size):
+def blockwise_feedforward(feedforward, inputs, chunk_size, static_argnums=(1,),
+                          policy=jax.checkpoint_policies.nothing_saveable, pre_remat=True):
+    if not pre_remat:
+        remat_feedforward = partitioning.remat(feedforward, static_argnums=static_argnums, policy=policy)
+    else:
+        remat_feedforward = feedforward
     inputs = rearrange(inputs, 'b (c n) d -> b c n d', c=chunk_size)
-    def scan_ffn(remat_ffn, carry, hidden_states):
-        outputs = remat_ffn(hidden_states)
+    def scan_feedforward(remat_feedforward, carry, hidden_states):
+        outputs = remat_feedforward(hidden_states)
         return carry, outputs
     scan_axis = inputs.ndim - 2
     _, output = nn.scan(
-        scan_ffn,
+        scan_feedforward,
         variable_broadcast="params",
         split_rngs={"params": False, "dropout": True},
         in_axes=scan_axis,
         out_axes=scan_axis,
-    )(remat_ffn, None, inputs)
+    )(remat_feedforward, None, inputs)
     output = rearrange(output, 'b c n d -> b (c n) d')
     return output

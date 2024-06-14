@@ -2,37 +2,34 @@
 
 This codebase provides the implementation of the Ring Attention with Blockwise Transformers. The model is described in the paper [Ring Attention with Blockwise Transformers for Near-Infinite Context](https://arxiv.org/pdf/2310.01889.pdf) and [Blockwise Parallel Transformer for Large Context Models](https://arxiv.org/pdf/2305.19370.pdf).
 
-Blockwise Parallel Transformers (BPT) compute attention and feedforward in a blockwise manner, allowing for the training and inference of sequences up to four times longer than those manageable by standard memory-efficient attention methods, such as flash attention.
-
 Ring Attention with Blockwise Parallel Transformers enables training sequences up to a length of 'number of devices' times longer than those possible with BPT. This is achieved by distributing the attention and feedforward computation across multiple devices and overlapping the communication with computation. Thanks to the blockwise computing of the attention and feedforward network, it is possible to train with tens of millions of tokens in context size without adding any communication or computation overhead.
 
 
 ### Example usage here with code snippets
+First, install the package:
+```bash
+pip install ringattention
+```
+Then, `ringattention` and `blockwise_feedforward` can be imported and used as follows:
 ```python
-platform = xla_bridge.get_backend().platform
-if platform == "tpu":
-    ring_attention_fn = ring_flash_attention_tpu
-elif platform == "gpu":
-    ring_attention_fn = ring_flash_attention_gpu
-else:
-    raise ValueError(f"Unsupported platform: {platform}")
+from ringattention import ringattention, blockwise_feedforward
+```
+You can use the `ringattention` function by wrapping it with `shard_map` to shard the computation across multiple devices. Here is an example of how to use the `ringattention` function with sharding:
+```python
 ring_attention_sharded = shard_map(
     partial(
-        ring_attention_fn,
-        axis_name="sp", # if 'sp' is used, the function will be sharded along context size
+        ringattention,
+        axis_name="sp",
         float32_logits=True,
-        cache_idx=None, # no cache
+        cache_idx=None,
         blockwise_kwargs=dict(
-            causal_block_size=1, # equivalent to being causal
-            deterministic=deterministic,
-            dropout_rng=dropout_rng,
-            attn_pdrop=self.config.attn_pdrop,
-            query_chunk_size=self.config.scan_query_chunk_size,
-            key_chunk_size=self.config.scan_key_chunk_size,
-            dtype=self.dtype,
-            policy=get_gradient_checkpoint_policy('nothing_saveable'),
-            precision=self.precision,
-            prevent_cse=not self.config.scan_layers,
+            causal_block_size=1,
+            deterministic=True,
+            dropout_rng=None,
+            attn_pdrop=0.0,
+            query_chunk_size=512,
+            key_chunk_size=512,
+            policy=jax.checkpoint_policies.nothing_saveable,
         )
     ),
     mesh=LLaMAConfig.get_jax_mesh(self.config.mesh_dim),
@@ -49,7 +46,17 @@ ring_attention_sharded = shard_map(
 attn_output = ring_attention_sharded(xq, xk, xv, attention_bias, segment_ids)
 ```
 
-This codebase is utilized to train the Large World Model (LWM) whose project page is [LWM project](https://largeworldmodel.github.io/) and codebase with features for million-length vision-language training is [LWM codebase](https://github.com/LargeWorldModel/LWM).
+Explanation of the arguments:
+
+- `query_chunk_size` and `key_chunk_size` are the chunk sizes for the query and key. Use larger chunk sizes (subject to SRAM constraints) to speed up the computation.
+
+- `policy` is the checkpoint policy for the attention weights, use `jax.checkpoint_policies.nothing_saveable` to enable the checkpointing.
+
+- `causal_block_size` is the block size for block-causal attention. `causal_block_size=1` is equivalent to causal attention.
+
+- `cache_idx` is the cache index for inference. If `cache_idx` is not `None`, the attention weights will be cached and reused in the next inference.
+
+RingAttention is utilized in [Large World Model (LWM)](https://largeworldmodel.github.io/) for million-length vision-language training, where a complete example of using RingAttention and BlockwiseTransformers can be found: [LWM codebase](https://github.com/LargeWorldModel/LWM)
 
 
 ## Reference
