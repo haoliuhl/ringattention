@@ -1,8 +1,3 @@
-"""This module contains ring attention forward and backward pass, supporting both blockwise computation and TPU-compatible fused attention.
-It features blockwise computation for feedforward networks to reduce memory cost.
-For more details, refer to 'RingAttention' at https://arxiv.org/abs/2310.01889 and 'Blockwise Parallel Transformers' at https://arxiv.org/abs/2305.19370.
-"""
-
 import numpy as np
 import flax.linen as nn
 from flax.linen import partitioning
@@ -16,6 +11,10 @@ from functools import partial
 import dataclasses
 import functools
 from typing import Any, NamedTuple, Optional
+import os
+
+segment_ids_ops = os.environ.get('SEGMENT_IDS_OPS', 'equal')
+segment_ids_ops = getattr(jnp, segment_ids_ops)
 
 
 def _ring_attention_fwd(q, k, v, attn_bias, segment_ids, cache_idx, axis_name, float32_logits, blockwise_kwargs):
@@ -297,7 +296,7 @@ def _chunk_attention_bias(query_chunk_size, key_chunk_size,
             start_indices=(0, key_offset),
             slice_sizes=(segment_ids.shape[0], key_chunk_size)
         )
-        segment_ids_mask = q_segment_ids[:, :, None] != k_segment_ids[:, None, :]
+        segment_ids_mask = ~segment_ids_ops(q_segment_ids[:, :, None], k_segment_ids[:, None, :])
         segment_ids_mask = segment_ids_mask[:, None] # B1QK
         segment_ids_bias = segment_ids_mask * jnp.finfo(dtype).min
         chunk_bias = jnp.minimum(chunk_bias, segment_ids_bias)
