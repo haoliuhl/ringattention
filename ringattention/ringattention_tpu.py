@@ -815,9 +815,9 @@ def _flash_attention_impl(
             num_scalar_prefetch=2, in_specs=in_specs, out_specs=out_specs, grid=grid
         ),
         debug=debug,
-        mosaic_params=dict(
-            dimension_semantics=("parallel", "parallel", "parallel", "arbitrary")
-        ),
+        compiler_params=dict(
+            mosaic=dict(dimension_semantics=("parallel", "parallel", "parallel", "arbitrary"))
+        )
     )(
         q_chunk_idx_start,
         k_chunk_idx_start,
@@ -1227,14 +1227,9 @@ def _flash_attention_bwd_dkv(
                 num_scalar_prefetch=2, in_specs=in_specs, out_specs=out_specs, grid=grid
             ),
             debug=debug,
-            mosaic_params=dict(
-                dimension_semantics=(
-                    "parallel",
-                    "parallel",
-                    "parallel",
-                    "arbitrary",
-                )
-            ),
+            compiler_params=dict(
+                mosaic=dict(dimension_semantics=("parallel", "parallel", "parallel", "arbitrary"))
+            )
         )(
             q_chunk_idx_start,
             k_chunk_idx_start,
@@ -1613,14 +1608,9 @@ def _flash_attention_bwd_dq(
                 num_scalar_prefetch=2, in_specs=in_specs, out_specs=out_specs, grid=grid
             ),
             debug=debug,
-            mosaic_params=dict(
-                dimension_semantics=(
-                    "parallel",
-                    "parallel",
-                    "parallel",
-                    "arbitrary",
-                )
-            ),
+            compiler_params=dict(
+                mosaic=dict(dimension_semantics=("parallel", "parallel", "parallel", "arbitrary"))
+            )
         )(
             q_chunk_idx_start,
             k_chunk_idx_start,

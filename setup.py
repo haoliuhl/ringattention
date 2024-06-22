@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='ringattention',
-    version='0.1.0',
+    version='0.1.1',
     license='Apache-2.0',
     description='RingAttention for Transformers with Arbitrarily Large Context.',
     url='https://github.com/lhao499/ringattention',
@@ -10,7 +10,7 @@ setup(
     python_requires=">=3.10",
     install_requires=[
         'numpy',
-        'jax',
+        'jax>=0.4.29',
         'einops',
         'flax',
     ],
