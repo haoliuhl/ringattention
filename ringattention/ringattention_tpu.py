@@ -1,8 +1,3 @@
-"""This module contains ring attention forward and backward pass, supporting both blockwise computation and TPU-compatible fused attention.
-It features blockwise computation for feedforward networks to reduce memory cost.
-For more details, refer to 'RingAttention' at https://arxiv.org/abs/2310.01889 and 'Blockwise Parallel Transformers' at https://arxiv.org/abs/2305.19370.
-"""
-
 import numpy as np
 import flax.linen as nn
 import jax
@@ -16,7 +11,7 @@ import dataclasses
 import functools
 from typing import Any, NamedTuple, Optional
 
-from ringattention.ringattention_base import below_or_on_diag, _chunk_attention_bias
+from ringattention.ringattention_base import below_or_on_diag, segment_ids_ops
 
 
 def _ring_flash_attention_fwd_tpu(q, k, v, attn_bias, segment_ids, cache_idx, axis_name, float32_logits, blockwise_kwargs):
@@ -541,7 +536,7 @@ def _flash_attention_kernel_single_batch(
                     kv_segment_ids_tile_ref,
                     (batch_idx[0], pl.dslice(1), pl.dslice(start_k, block_k)),
                 )  # [1, block_k].
-                mask = jnp.equal(q_segment_ids, kv_segment_ids).astype(jnp.bool_)
+                mask = segment_ids_ops(q_segment_ids, kv_segment_ids).astype(jnp.bool_)
 
             if causal_block_size is not None:
                 mask_shape = (block_q, block_k)
@@ -939,7 +934,7 @@ def _flash_attention_dkv_kernel(
                 kv_segment_ids = pl.load(
                     kv_segment_ids_tile_ref, (slice(None), 0, pl.ds(start_k, block_k))
                 )  # [1, block_k].
-                mask = jnp.equal(q_segment_ids, kv_segment_ids).astype(jnp.bool_)
+                mask = segment_ids_ops(q_segment_ids, kv_segment_ids).astype(jnp.bool_)
 
             if causal_block_size is not None:
                 mask_shape = (block_q, block_k)
@@ -1338,7 +1333,7 @@ def _flash_attention_dq_kernel(
             kv_segment_ids = pl.load(
                 kv_segment_ids_tile_ref, (slice(None), 0, k_slice)
             )  # [1, block_k].
-            mask = jnp.equal(q_segment_ids, kv_segment_ids).astype(jnp.bool_)
+            mask = segment_ids_ops(q_segment_ids, kv_segment_ids).astype(jnp.bool_)
 
         if causal_block_size is not None:
             mask_shape = (block_q_major, block_k)
