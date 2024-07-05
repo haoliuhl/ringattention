@@ -20,7 +20,8 @@ def _ring_flash_attention_fwd_tpu(q, k, v, attn_bias, segment_ids, cache_idx, ax
     q, k, v = map(lambda x: rearrange(x, 'b q h d -> b h q d'), [q, k, v])
     batch, num_heads, q_len, dim_per_head = q.shape
     batch, num_heads, kv_len, dim_per_head = k.shape
-    attn_bias = attn_bias[:, 0, 0] # (batch, k_len)
+    if attn_bias is not None:
+        attn_bias = attn_bias[:, 0, 0] # (batch, k_len)
 
     o = jnp.zeros((batch, num_heads, q_len, dim_per_head)).astype(q.dtype)
     l = jnp.zeros((batch, num_heads, q_len)).astype(q.dtype)
@@ -56,9 +57,12 @@ def _ring_flash_attention_fwd_tpu(q, k, v, attn_bias, segment_ids, cache_idx, ax
     scale = q.shape[-1] ** -0.5
     def scan_kv_block(carry, idx):
         o, l, m, k, v = carry
-        attn_bias_slice = lax.dynamic_slice_in_dim(attn_bias,
-            (lax.axis_index(axis_name) - idx) % axis_size * kv_len, kv_len, axis=-1
-        )
+        if attn_bias is not None:
+            attn_bias_slice = lax.dynamic_slice_in_dim(attn_bias,
+                (lax.axis_index(axis_name) - idx) % axis_size * kv_len, kv_len, axis=-1
+            )
+        else:
+            attn_bias_slice = None
         if segment_ids is not None:
             kv_segment_ids = lax.dynamic_slice_in_dim(
                 segment_ids,
@@ -133,9 +137,12 @@ def _ring_flash_attention_bwd_tpu(axis_name, float32_logits, blockwise_kwargs, r
 
     def scan_kv_block(carry, idx):
         dq, dk, dv, k, v = carry
-        attn_bias_slice = lax.dynamic_slice_in_dim(attn_bias,
-            (lax.axis_index(axis_name) - idx) % axis_size * kv_len, kv_len, axis=-1
-        )
+        if attn_bias is not None:
+            attn_bias_slice = lax.dynamic_slice_in_dim(attn_bias,
+                (lax.axis_index(axis_name) - idx) % axis_size * kv_len, kv_len, axis=-1
+            )
+        else:
+            attn_bias_slice = None
         if segment_ids is not None:
             kv_segment_ids = lax.dynamic_slice_in_dim(
                 segment_ids,

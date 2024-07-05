@@ -16,7 +16,6 @@ import os
 segment_ids_ops = os.environ.get('SEGMENT_IDS_OPS', 'equal')
 segment_ids_ops = getattr(jnp, segment_ids_ops)
 
-
 def _ring_attention_fwd(q, k, v, attn_bias, segment_ids, cache_idx, axis_name, float32_logits, blockwise_kwargs):
     if float32_logits:
         q, k = q.astype(jnp.float32), k.astype(jnp.float32)
@@ -308,7 +307,7 @@ def _chunk_attention_bias(query_chunk_size, key_chunk_size,
         key_idx += key_offset
         query_idx //= causal_block_size
         key_idx //= causal_block_size
-        causal_mask_value = (query_idx < key_idx) * jnp.finfo(dtype).min
+        causal_mask_value = ((2 * int(os.environ['num_backattention']) - 1) * query_idx < key_idx) * jnp.finfo(dtype).min
         chunk_bias = jnp.minimum(chunk_bias, causal_mask_value.reshape(1, 1, *causal_mask_value.shape))
 
     if not deterministic and attn_pdrop > 0.0:
