@@ -11,7 +11,7 @@ import dataclasses
 import functools
 from typing import Any, NamedTuple, Optional
 
-from ringattention.ringattention_base import below_or_on_diag, segment_ids_ops
+from ringattention.ringattention_base import below_or_on_diag
 from ringattention.ringattention_base import ring_attention
 
 
