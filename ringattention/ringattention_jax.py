@@ -13,6 +13,7 @@ import functools
 from typing import Any, NamedTuple, Optional
 import os
 
+
 def _ring_attention_fwd(q, k, v, attn_bias, segment_ids, cache_idx, axis_name, float32_logits, blockwise_kwargs):
     if float32_logits:
         q, k = q.astype(jnp.float32), k.astype(jnp.float32)
@@ -329,8 +330,6 @@ def below_or_on_diag(r, r_blk_size, c, c_blk_size, causal_block_size):
     c = jax.lax.div(c, causal_block_size_k // c_blk_size)
     return ((r + 1) * causal_block_size_q - 1) > (c * causal_block_size_k)
 
-
-# Blockwise feedforward network for memory-efficient training
 def blockwise_feedforward(feedforward, inputs, chunk_size, static_argnums=(1,),
                           policy=jax.checkpoint_policies.nothing_saveable, pre_remat=True):
     if not pre_remat:

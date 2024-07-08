@@ -11,7 +11,7 @@ import dataclasses
 import functools
 from typing import Any, NamedTuple, Optional
 
-from ringattention.ringattention_base import below_or_on_diag
+from ringattention.ringattention_jax import below_or_on_diag
 
 
 def _ring_flash_attention_fwd_tpu(q, k, v, attn_bias, segment_ids, cache_idx, axis_name, float32_logits, blockwise_kwargs):

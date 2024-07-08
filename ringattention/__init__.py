@@ -1,20 +1,24 @@
-"""This module contains ring attention forward and backward pass, supporting both blockwise computation and TPU-compatible fused attention.
+"""This module contains RingAttention forward and backward pass, supporting both blockwise computation in Jax and fused computation in Pallas.
 It features blockwise computation for feedforward networks to reduce memory cost.
-For more details, refer to 'RingAttention' at https://arxiv.org/abs/2310.01889 and 'Blockwise Parallel Transformers' at https://arxiv.org/abs/2305.19370.
+For more details, refer to RingAttention ('Ring Attention with Blockwise Transformers for Near-Infinite Context') at https://arxiv.org/abs/2310.01889 and BlockwiseTransformer ('Blockwise Parallel Transformer for Large Context Models') at https://arxiv.org/abs/2305.19370.
 """
 
-from .ringattention_base import ring_attention as ring_attention_base
-from .ringattention_base import blockwise_feedforward
-from .ringattention_gpu import ring_flash_attention_gpu
-from .ringattention_tpu import ring_flash_attention_tpu
+from .ringattention_jax import ring_attention, blockwise_feedforward
+from .ringattention_pallas_gpu import ring_flash_attention_gpu
+from .ringattention_pallas_tpu import ring_flash_attention_tpu
 import jax
 
 platform = jax.lib.xla_bridge.get_backend().platform
 if platform == "tpu":
+    # pallas ringattention for tpu
     ringattention = ring_flash_attention_tpu
 elif platform == "gpu":
+    # pallas ringattention for gpu
     ringattention = ring_flash_attention_gpu
 else:
-    ringattention = ring_attention_base
+    # jax ringattention
+    ringattention = ring_attention
 
-__all__ = ["ringattention", "blockwise_feedforward"]
+ringattention_jax = ring_attention
+
+__all__ = ["ringattention", "blockwise_feedforward", "ringattention_jax"]

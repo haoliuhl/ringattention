@@ -140,3 +140,4 @@ cython_debug/
 # local
 jobs/
 local/
+.vscode/
