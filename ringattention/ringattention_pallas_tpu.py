@@ -87,6 +87,9 @@ def _ring_flash_attention_fwd_tpu(q, k, v, attn_bias, segment_ids, cache_idx, ax
             segment_ids=segment_ids_slice,
             save_residuals=False,
             causal_block_size=blockwise_kwargs["causal_block_size"],
+            attention_order=blockwise_kwargs["attention_order"],
+            ring_block_size=blockwise_kwargs["ring_block_size"],
+            sp_size=blockwise_kwargs["sp_size"],
             sm_scale=scale,
             block_sizes=block_sizes,
             debug=False
@@ -161,6 +164,9 @@ def _ring_flash_attention_bwd_tpu(axis_name, float32_logits, blockwise_kwargs, r
         dq_i, dk_i, dv_i, = _flash_attention_bwd(
             save_residuals=False,
             causal_block_size=blockwise_kwargs["causal_block_size"],
+            attention_order=blockwise_kwargs["attention_order"],
+            ring_block_size=blockwise_kwargs["ring_block_size"],
+            sp_size=blockwise_kwargs["sp_size"],
             sm_scale=scale,
             block_sizes=block_sizes,
             debug=False,
@@ -292,6 +298,9 @@ def _flash_attention(
     segment_ids,
     save_residuals,
     causal_block_size,
+    attention_order,
+    ring_block_size,
+    sp_size,
     sm_scale,
     block_sizes,
     debug,
@@ -307,6 +316,9 @@ def _flash_attention(
         segment_ids,
         save_residuals,
         causal_block_size,
+        attention_order,
+        ring_block_size,
+        sp_size,
         sm_scale,
         block_sizes.block_b,
         block_sizes.block_q,
@@ -327,6 +339,9 @@ def _flash_attention_fwd(
     segment_ids,
     save_residuals,
     causal_block_size,
+    attention_order,
+    ring_block_size,
+    sp_size,
     sm_scale,
     block_sizes,
     debug,
@@ -344,6 +359,9 @@ def _flash_attention_fwd(
         segment_ids,
         True,
         causal_block_size,
+        attention_order,
+        ring_block_size,
+        sp_size,
         sm_scale,
         block_sizes,
         debug,
@@ -354,6 +372,9 @@ def _flash_attention_fwd(
 def _flash_attention_bwd(
     save_residuals: bool,
     causal_block_size: Optional[int],
+    attention_order,
+    ring_block_size,
+    sp_size,
     sm_scale: float,
     block_sizes: BlockSizes,
     debug: bool,
@@ -394,6 +415,9 @@ def _flash_attention_bwd(
         block_q=block_sizes.block_q_dkv,
         sm_scale=sm_scale,
         causal_block_size=causal_block_size,
+        attention_order=attention_order,
+        ring_block_size=ring_block_size,
+        sp_size=sp_size,
         mask_value=DEFAULT_MASK_VALUE,
         debug=debug,
     )
@@ -415,6 +439,9 @@ def _flash_attention_bwd(
         block_k=block_sizes.block_k_dq,
         sm_scale=sm_scale,
         causal_block_size=causal_block_size,
+        attention_order=attention_order,
+        ring_block_size=ring_block_size,
+        sp_size=sp_size,
         mask_value=DEFAULT_MASK_VALUE,
         debug=debug,
     )
@@ -467,6 +494,9 @@ def _flash_attention_kernel_single_batch(
     m_ref: Any | None = None,
     *,
     causal_block_size,
+    attention_order,
+    ring_block_size,
+    sp_size,
     sm_scale,
     block_k,
     kv_seq_len,
@@ -495,7 +525,9 @@ def _flash_attention_kernel_single_batch(
             block_q,
             kv_seq_idx + k_chunk_idx_start,
             block_k_major,
-            causal_block_size
+            causal_block_size,
+            attention_order,
+            ring_block_size,
         )
     else:
         should_run = True
@@ -546,17 +578,44 @@ def _flash_attention_kernel_single_batch(
                 mask = jnp.equal(q_segment_ids, kv_segment_ids).astype(jnp.bool_)
 
             if causal_block_size is not None:
-                mask_shape = (block_q, block_k)
-                row_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 0)
-                row_ids += (q_seq_idx + q_chunk_idx_start) * block_q
-                row_ids = jax.lax.div(row_ids, causal_block_size)
-                col_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 1)
-                col_ids += (kv_seq_idx + k_chunk_idx_start) * block_k_major + start_k
-                col_ids = jax.lax.div(col_ids, causal_block_size)
-                causal_mask = col_ids <= row_ids
-                mask = (
-                    causal_mask if mask is None else jnp.logical_and(mask, causal_mask)
-                )
+                if attention_order == 'standard':
+                    mask_shape = (block_q, block_k)
+                    row_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 0)
+                    row_ids += (q_seq_idx + q_chunk_idx_start) * block_q
+                    row_ids = jax.lax.div(row_ids, causal_block_size)
+                    col_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 1)
+                    col_ids += (kv_seq_idx + k_chunk_idx_start) * block_k_major + start_k
+                    col_ids = jax.lax.div(col_ids, causal_block_size)
+                    causal_mask = col_ids <= row_ids
+                    mask = (
+                        causal_mask if mask is None else jnp.logical_and(mask, causal_mask)
+                    )
+                elif attention_order == 'striped':
+                    mask_shape = (block_q, block_k)
+                    row_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 0)
+                    row_offset = (q_seq_idx + q_chunk_idx_start) * block_q
+                    row_offset_in_block = jax.lax.rem(row_offset, ring_block_size)
+                    row_ids += row_offset_in_block
+                    col_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 1)
+                    col_offset = (kv_seq_idx + k_chunk_idx_start) * block_k_major + start_k
+                    col_offset_in_block = jax.lax.rem(col_offset, ring_block_size)
+                    col_ids += col_offset_in_block
+
+                    if causal_block_size <= sp_size:
+                        row_ring_block_idx = jax.lax.div(row_offset, ring_block_size)
+                        col_ring_block_idx = jax.lax.div(col_offset, ring_block_size)
+                        exclude_diagonal = jax.lax.div(row_ring_block_idx, causal_block_size) < jax.lax.div(col_ring_block_idx, causal_block_size)
+                        row_ids -= exclude_diagonal.astype(row_ids.dtype)
+                    else:
+                        causal_block_size_b = causal_block_size // sp_size
+                        row_ids = jax.lax.div(row_ids, causal_block_size_b)
+                        col_ids = jax.lax.div(col_ids, causal_block_size_b)
+                    causal_mask = col_ids <= row_ids
+                    mask = (
+                        causal_mask if mask is None else jnp.logical_and(mask, causal_mask)
+                    )
+                else:
+                    raise NotImplementedError(attention_order)
 
             s = s if mask is None else s + jnp.where(mask, 0.0, mask_value)
 
@@ -618,6 +677,9 @@ def _flash_attention_impl(
     segment_ids,
     save_residuals,
     causal_block_size,
+    attention_order,
+    ring_block_size,
+    sp_size,
     sm_scale,
     block_b,
     block_q,
@@ -668,6 +730,8 @@ def _flash_attention_impl(
                     kv_seq_index + k_idx_ref[0],
                     block_k_major,
                     causal_block_size,
+                    attention_order,
+                    ring_block_size
                 ),
                 kv_seq_index,
                 0,
@@ -685,7 +749,9 @@ def _flash_attention_impl(
                 block_q,
                 kv_seq_index + k_idx_ref[0],
                 block_k_major,
-                causal_block_size
+                causal_block_size,
+                attention_order,
+                ring_block_size
             )
             next_kv_index = lax.select(should_run, kv_seq_index, 0)
         else:
@@ -702,6 +768,9 @@ def _flash_attention_impl(
     kernel = functools.partial(
         _flash_attention_kernel,
         causal_block_size=causal_block_size,
+        attention_order=attention_order,
+        ring_block_size=ring_block_size,
+        sp_size=sp_size,
         mask_value=DEFAULT_MASK_VALUE,
         sm_scale=sm_scale,
         block_k=block_k,
@@ -771,6 +840,8 @@ def _flash_attention_impl(
                         kv_seq_index + k_idx_ref[0],
                         block_k_major,
                         causal_block_size,
+                        attention_order,
+                        ring_block_size
                     ),
                     kv_seq_index,
                     0,
@@ -865,6 +936,9 @@ def _flash_attention_dkv_kernel(
     *,
     sm_scale: float,
     causal_block_size: Optional[int],
+    attention_order: str,
+    ring_block_size: int,
+    sp_size: int,
     mask_value: float,
     q_seq_len: int,
     block_q: int,
@@ -944,17 +1018,44 @@ def _flash_attention_dkv_kernel(
                 mask = jnp.equal(q_segment_ids, kv_segment_ids).astype(jnp.bool_)
 
             if causal_block_size is not None:
-                mask_shape = (block_q, block_k)
-                row_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 0)
-                row_ids += (q_seq_index + q_chunk_idx_start) * block_q_major + start_q
-                row_ids = jax.lax.div(row_ids, causal_block_size)
-                col_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 1)
-                col_ids += (kv_seq_index + k_chunk_idx_start) * block_k_major + start_k
-                col_ids = jax.lax.div(col_ids, causal_block_size)
-                causal_mask = col_ids <= row_ids
-                mask = (
-                    causal_mask if mask is None else jnp.logical_and(mask, causal_mask)
-                )
+                if attention_order == 'standard':
+                    mask_shape = (block_q, block_k)
+                    row_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 0)
+                    row_ids += (q_seq_index + q_chunk_idx_start) * block_q
+                    row_ids = jax.lax.div(row_ids, causal_block_size)
+                    col_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 1)
+                    col_ids += (kv_seq_index + k_chunk_idx_start) * block_k_major + start_k
+                    col_ids = jax.lax.div(col_ids, causal_block_size)
+                    causal_mask = col_ids <= row_ids
+                    mask = (
+                        causal_mask if mask is None else jnp.logical_and(mask, causal_mask)
+                    )
+                elif attention_order == 'striped':
+                    mask_shape = (block_q, block_k)
+                    row_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 0)
+                    row_offset = (q_seq_index + q_chunk_idx_start) * block_q
+                    row_offset_in_block = jax.lax.rem(row_offset, ring_block_size)
+                    row_ids += row_offset_in_block
+                    col_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 1)
+                    col_offset = (kv_seq_index + k_chunk_idx_start) * block_k_major + start_k
+                    col_offset_in_block = jax.lax.rem(col_offset, ring_block_size)
+                    col_ids += col_offset_in_block
+
+                    if causal_block_size <= sp_size:
+                        row_ring_block_idx = jax.lax.div(row_offset, ring_block_size)
+                        col_ring_block_idx = jax.lax.div(col_offset, ring_block_size)
+                        exclude_diagonal = jax.lax.div(row_ring_block_idx, causal_block_size) < jax.lax.div(col_ring_block_idx, causal_block_size)
+                        row_ids -= exclude_diagonal.astype(col_ids.dtype)
+                    else:
+                        causal_block_size_b = causal_block_size // sp_size
+                        row_ids = jax.lax.div(row_ids, causal_block_size_b)
+                        col_ids = jax.lax.div(col_ids, causal_block_size_b)
+                    causal_mask = col_ids <= row_ids
+                    mask = (
+                        causal_mask if mask is None else jnp.logical_and(mask, causal_mask)
+                    )
+                else:
+                    raise NotImplementedError(attention_order)
 
             capped_logits = (
                 capped_logits
@@ -1005,7 +1106,9 @@ def _flash_attention_dkv_kernel(
             block_q_major,
             kv_seq_index + k_chunk_idx_start,
             block_k_major,
-            causal_block_size
+            causal_block_size,
+            attention_order,
+            ring_block_size
         )
     else:
         should_run = True
@@ -1039,6 +1142,9 @@ def _flash_attention_bwd_dkv(
     block_k: int | None,
     sm_scale: float,
     causal_block_size: Optional[int] = None,
+    attention_order: str = None,
+    ring_block_size: int = 0,
+    sp_size: int = 1,
     mask_value: float = DEFAULT_MASK_VALUE,
     debug: bool = False,
 ):
@@ -1079,7 +1185,9 @@ def _flash_attention_bwd_dkv(
                     block_q_major,
                     kv_seq_index + k_idx_ref[0],
                     block_k_major,
-                    causal_block_size
+                    causal_block_size,
+                    attention_order,
+                    ring_block_size
                 ),
                 q_seq_index,
                 0,
@@ -1144,7 +1252,9 @@ def _flash_attention_bwd_dkv(
                         block_q_major,
                         kv_seq_index + k_idx_ref[0],
                         block_k_major,
-                        causal_block_size
+                        causal_block_size,
+                        attention_order,
+                        ring_block_size,
                     ),
                     q_seq_index,
                     0,
@@ -1220,6 +1330,9 @@ def _flash_attention_bwd_dkv(
         block_k=block_k,
         sm_scale=sm_scale,
         causal_block_size=causal_block_size,
+        attention_order=attention_order,
+        ring_block_size=ring_block_size,
+        sp_size=sp_size,
         mask_value=mask_value,
         q_seq_len=q_seq_len,
     )
@@ -1275,6 +1388,9 @@ def _flash_attention_dq_kernel(
     *,
     sm_scale: float,
     causal_block_size: Optional[int],
+    attention_order: str,
+    ring_block_size: int,
+    sp_size: int,
     mask_value: float,
     kv_seq_len: int,
     block_k: int,
@@ -1338,15 +1454,44 @@ def _flash_attention_dq_kernel(
             mask = jnp.equal(q_segment_ids, kv_segment_ids).astype(jnp.bool_)
 
         if causal_block_size is not None:
-            mask_shape = (block_q_major, block_k)
-            row_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 0)
-            row_ids += (q_seq_index + q_chunk_idx_start) * block_q_major
-            row_ids = jax.lax.div(row_ids, causal_block_size)
-            col_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 1)
-            col_ids += (kv_seq_index + k_chunk_idx_start) * block_k_major + i * block_k
-            col_ids = jax.lax.div(col_ids, causal_block_size)
-            causal_mask = col_ids <= row_ids
-            mask = causal_mask if mask is None else jnp.logical_and(mask, causal_mask)
+            if attention_order == 'standard':
+                mask_shape = (block_q_major, block_k)
+                row_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 0)
+                row_ids += (q_seq_index + q_chunk_idx_start) * block_q_major
+                row_ids = jax.lax.div(row_ids, causal_block_size)
+                col_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 1)
+                col_ids += (kv_seq_index + k_chunk_idx_start) * block_k_major + i * block_k
+                col_ids = jax.lax.div(col_ids, causal_block_size)
+                causal_mask = col_ids <= row_ids
+                mask = (
+                    causal_mask if mask is None else jnp.logical_and(mask, causal_mask)
+                )
+            elif attention_order == 'striped':
+                mask_shape = (block_q_major, block_k)
+                row_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 0)
+                row_offset = (q_seq_index + q_chunk_idx_start) * block_q_major
+                row_offset_in_block = jax.lax.rem(row_offset, ring_block_size)
+                row_ids += row_offset_in_block
+                col_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 1)
+                col_offset = (kv_seq_index + k_chunk_idx_start) * block_k_major + i * block_k
+                col_offset_in_block = jax.lax.rem(col_offset, ring_block_size)
+                col_ids += col_offset_in_block
+
+                if causal_block_size <= sp_size:
+                    row_ring_block_idx = jax.lax.div(row_offset, ring_block_size)
+                    col_ring_block_idx = jax.lax.div(col_offset, ring_block_size)
+                    exclude_diagonal = jax.lax.div(row_ring_block_idx, causal_block_size) < jax.lax.div(col_ring_block_idx, causal_block_size)
+                    row_ids -= exclude_diagonal.astype(col_ids.dtype)
+                else:
+                    causal_block_size_b = causal_block_size // sp_size
+                    row_ids = jax.lax.div(row_ids, causal_block_size_b)
+                    col_ids = jax.lax.div(col_ids, causal_block_size_b)
+                causal_mask = col_ids <= row_ids
+                mask = (
+                    causal_mask if mask is None else jnp.logical_and(mask, causal_mask)
+                )
+            else:
+                raise NotImplementedError(attention_order)
         capped_logits = (
             capped_logits
             if mask is None
@@ -1393,7 +1538,9 @@ def _flash_attention_dq_kernel(
             block_q_major,
             kv_seq_index + k_chunk_idx_start,
             block_k_major,
-            causal_block_size
+            causal_block_size,
+            attention_order,
+            ring_block_size,
         )
         should_not_run = lax.select(should_run, False, True)
     else:
@@ -1433,6 +1580,9 @@ def _flash_attention_bwd_dq(
     block_k: int | None,
     sm_scale: float,
     causal_block_size: Optional[int],
+    attention_order: str,
+    ring_block_size: int,
+    sp_size: int,
     mask_value: float,
     debug: bool,
 ):
@@ -1477,7 +1627,9 @@ def _flash_attention_bwd_dq(
                     block_q_major,
                     kv_seq_index + k_idx_ref[0],
                     block_k_major,
-                    causal_block_size
+                    causal_block_size,
+                    attention_order,
+                    ring_block_size,
                 ),
                 kv_seq_index,
                 0,
@@ -1540,7 +1692,9 @@ def _flash_attention_bwd_dq(
                         block_q_major,
                         kv_seq_index + k_idx_ref[0],
                         block_k_major,
-                        causal_block_size
+                        causal_block_size,
+                        attention_order,
+                        ring_block_size,
                     ),
                     kv_seq_index,
                     0,
@@ -1602,6 +1756,9 @@ def _flash_attention_bwd_dq(
         _flash_attention_dq_kernel,
         sm_scale=sm_scale,
         causal_block_size=causal_block_size,
+        attention_order=attention_order,
+        ring_block_size=ring_block_size,
+        sp_size=sp_size,
         mask_value=mask_value,
         block_k=block_k,
         kv_seq_len=kv_seq_len,

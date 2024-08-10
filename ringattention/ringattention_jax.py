@@ -42,6 +42,8 @@ def _ring_attention_fwd(q, k, v, attn_bias, segment_ids, cache_idx, axis_name, f
             bias=attn_bias,
             segment_ids=segment_ids,
             cache_idx=cache_idx,
+            ring_block_size=kv_len,
+            sp_size=axis_size,
             **blockwise_kwargs
         )
         k, v = map(lambda x: lax.ppermute(x, axis_name, perm=[(i, (i + 1) % axis_size) for i in range(axis_size)]), (k, v))
@@ -80,6 +82,8 @@ def _ring_attention_bwd(axis_name, float32_logits, blockwise_kwargs, res, g):
             bias=attn_bias,
             segment_ids=segment_ids,
             cache_idx=cache_idx,
+            ring_block_size=kv_len,
+            sp_size=axis_size,
             **blockwise_kwargs
         )
         k, v, dk, dv = map(lambda x: lax.ppermute(x, axis_name, perm=[(i,
@@ -97,7 +101,8 @@ def ring_attention(q, k, v, attn_bias, segment_ids, cache_idx, axis_name, float3
 ring_attention.defvjp(_ring_attention_fwd, _ring_attention_bwd)
 
 def _blockwise_attention_fwd(q, k, v, carry, q_chunk_idx_start, k_chunk_idx_start, bias, segment_ids, causal_block_size, query_chunk_size,
-                             key_chunk_size, deterministic, dropout_rng, attn_pdrop, dtype, policy, precision, prevent_cse, cache_idx):
+                             key_chunk_size, deterministic, dropout_rng, attn_pdrop, dtype, policy, precision, prevent_cse, cache_idx,
+                             attention_order, ring_block_size, sp_size):
     batch, q_len, num_heads, dim_per_head = q.shape
     batch, kv_len, num_heads, dim_per_head = k.shape
     batch, kv_len, num_heads, dim_per_head = v.shape
@@ -124,7 +129,8 @@ def _blockwise_attention_fwd(q, k, v, carry, q_chunk_idx_start, k_chunk_idx_star
     _chunk_bias_fn = partial(
         _chunk_attention_bias,
         query_chunk_size, key_chunk_size, bias, segment_ids, deterministic,
-        attn_dropout, attn_pdrop, causal_block_size, dtype)
+        attn_dropout, attn_pdrop, causal_block_size, dtype,
+        attention_order, ring_block_size, sp_size)
     def scan_attention(_, scan):
         q_chunk, numerator_chunk, denominator_chunk, max_score_chunk, q_chunk_idx = scan
         @partial(jax.checkpoint, prevent_cse=prevent_cse, policy=policy)
@@ -153,7 +159,9 @@ def _blockwise_attention_fwd(q, k, v, carry, q_chunk_idx_start, k_chunk_idx_star
                     query_chunk_size,
                     k_chunk_idx_start + k_chunk_idx,
                     key_chunk_size,
-                    causal_block_size
+                    causal_block_size,
+                    attention_order,
+                    ring_block_size,
                 )
             return jax.lax.cond(
                 should_run,
@@ -178,7 +186,7 @@ def _blockwise_attention_fwd(q, k, v, carry, q_chunk_idx_start, k_chunk_idx_star
 
     return numerator, denominator, max_score
 
-def _blockwise_attention_bwd(q, k, v, g, carry, q_chunk_idx_start, k_chunk_idx_start, bias, segment_ids, causal_block_size, query_chunk_size, key_chunk_size, deterministic, dropout_rng, attn_pdrop, dtype, policy, precision, prevent_cse, cache_idx):
+def _blockwise_attention_bwd(q, k, v, g, carry, q_chunk_idx_start, k_chunk_idx_start, bias, segment_ids, causal_block_size, query_chunk_size, key_chunk_size, deterministic, dropout_rng, attn_pdrop, dtype, policy, precision, prevent_cse, cache_idx, attention_order, ring_block_size, sp_size):
     batch, q_len, num_heads, dim_per_head = q.shape
     batch, kv_len, num_heads, dim_per_head = k.shape
     batch, kv_len, num_heads, dim_per_head = v.shape
@@ -211,7 +219,8 @@ def _blockwise_attention_bwd(q, k, v, g, carry, q_chunk_idx_start, k_chunk_idx_s
     _chunk_bias_fn = partial(
         _chunk_attention_bias,
         query_chunk_size, key_chunk_size, bias, segment_ids, deterministic,
-        attn_dropout, attn_pdrop, causal_block_size, dtype)
+        attn_dropout, attn_pdrop, causal_block_size, dtype,
+        attention_order, ring_block_size, sp_size)
     def scan_attention(carry, scan):
         dk, dv = carry
         q_chunk, dq_chunk, g_chunk, output_chunk, denominator_chunk, max_score_chunk, q_chunk_idx = scan
@@ -241,7 +250,9 @@ def _blockwise_attention_bwd(q, k, v, g, carry, q_chunk_idx_start, k_chunk_idx_s
                     query_chunk_size,
                     k_chunk_idx_start + k_chunk_idx,
                     key_chunk_size,
-                    causal_block_size
+                    causal_block_size,
+                    attention_order,
+                    ring_block_size,
                 )
             return lax.cond(
                 should_run,
@@ -271,7 +282,7 @@ def _blockwise_attention_bwd(q, k, v, g, carry, q_chunk_idx_start, k_chunk_idx_s
 
 def _chunk_attention_bias(query_chunk_size, key_chunk_size,
             bias, segment_ids, deterministic, attn_dropout, attn_pdrop, causal_block_size,
-            dtype, query_chunk_idx, key_chunk_idx):
+            dtype, attention_order, ring_block_size, sp_size, query_chunk_idx, key_chunk_idx):
     query_offset = query_chunk_idx * query_chunk_size
     key_offset = key_chunk_idx * key_chunk_size
     chunk_bias = jnp.zeros((1, 1, 1, 1), dtype=dtype)
@@ -299,14 +310,37 @@ def _chunk_attention_bias(query_chunk_size, key_chunk_size,
         chunk_bias = jnp.minimum(chunk_bias, segment_ids_bias)
 
     if causal_block_size is not None:
-        query_idx = lax.broadcasted_iota(dtype=jnp.int32, shape=(query_chunk_size, 1), dimension=0)
-        query_idx += query_offset
-        key_idx = lax.broadcasted_iota(dtype=jnp.int32, shape=(1, key_chunk_size), dimension=1)
-        key_idx += key_offset
-        query_idx //= causal_block_size
-        key_idx //= causal_block_size
-        causal_mask_value = (query_idx < key_idx) * jnp.finfo(dtype).min
-        chunk_bias = jnp.minimum(chunk_bias, causal_mask_value.reshape(1, 1, *causal_mask_value.shape))
+        if attention_order == 'standard':
+            query_idx = lax.broadcasted_iota(dtype=jnp.int32, shape=(query_chunk_size, 1), dimension=0)
+            query_idx += query_offset
+            key_idx = lax.broadcasted_iota(dtype=jnp.int32, shape=(1, key_chunk_size), dimension=1)
+            key_idx += key_offset
+            query_idx //= causal_block_size
+            key_idx //= causal_block_size
+            causal_mask_value = (query_idx < key_idx) * jnp.finfo(dtype).min
+            chunk_bias = jnp.minimum(chunk_bias, causal_mask_value.reshape(1, 1, *causal_mask_value.shape))
+        elif attention_order == 'striped':
+            query_ring_block_idx = query_offset // ring_block_size
+            key_ring_block_idx = key_offset // ring_block_size
+            query_idx = lax.broadcasted_iota(dtype=jnp.int32, shape=(query_chunk_size, 1), dimension=0)
+            query_offset_in_block = query_offset % ring_block_size
+            query_idx += query_offset_in_block
+            key_idx = lax.broadcasted_iota(dtype=jnp.int32, shape=(1, key_chunk_size), dimension=1)
+            key_offset_in_block = key_offset % ring_block_size
+            key_idx += key_offset_in_block
+
+            if causal_block_size <= sp_size:
+                exclude_diagonal = (query_ring_block_idx // causal_block_size) < (key_ring_block_idx // causal_block_size)
+                query_idx -= exclude_diagonal
+            else:
+                causal_block_size = causal_block_size // sp_size
+                query_idx //= causal_block_size
+                key_idx //= causal_block_size
+
+            causal_mask_value = (query_idx < key_idx) * jnp.finfo(dtype).min
+            chunk_bias = jnp.minimum(chunk_bias, causal_mask_value.reshape(1, 1, *causal_mask_value.shape))
+        else:
+            raise NotImplementedError(attention_order)
 
     if not deterministic and attn_pdrop > 0.0:
         attn_dropout_slice = lax.dynamic_slice(
@@ -321,14 +355,16 @@ def _chunk_attention_bias(query_chunk_size, key_chunk_size,
         chunk_bias += attn_dropout_slice * jnp.finfo(dtype).min
     return chunk_bias.astype(dtype)
 
-def below_or_on_diag(r, r_blk_size, c, c_blk_size, causal_block_size):
-    # A block is considered below or on diagonal as long as the bottom left
-    # corner of the block is below or on diagonal.
-    causal_block_size_q = max(causal_block_size, r_blk_size)
-    causal_block_size_k = max(causal_block_size, c_blk_size)
-    r = jax.lax.div(r, causal_block_size_q // r_blk_size)
-    c = jax.lax.div(c, causal_block_size_k // c_blk_size)
-    return ((r + 1) * causal_block_size_q - 1) > (c * causal_block_size_k)
+def below_or_on_diag(r, r_blk_size, c, c_blk_size, causal_block_size, attention_order, ring_block_size):
+    q_lo = r * r_blk_size
+    k_lo = c * c_blk_size
+    if attention_order == "striped":
+        q_lo = jax.lax.rem(q_lo, ring_block_size)
+        k_lo = jax.lax.rem(k_lo, ring_block_size)
+    else:
+        assert attention_order == "standard"
+    q_hi = q_lo + r_blk_size + causal_block_size - 1
+    return q_hi > k_lo
 
 def blockwise_feedforward(feedforward, inputs, chunk_size, static_argnums=(1,),
                           policy=jax.checkpoint_policies.nothing_saveable, pre_remat=True):
