@@ -30,6 +30,9 @@ ring_attention_sharded = shard_map(
             query_chunk_size=512,
             key_chunk_size=512,
             policy=jax.checkpoint_policies.nothing_saveable,
+            dtype=jax.numpy.float32,
+            precision=None,
+            prevent_cse=True,
         )
     ),
     mesh=LLaMAConfig.get_jax_mesh(self.config.mesh_dim),
@@ -48,7 +51,7 @@ attn_output = ring_attention_sharded(xq, xk, xv, attention_bias, segment_ids)
 
 Explanation of the arguments:
 
-- `query_chunk_size` and `key_chunk_size` are the chunk sizes for the query and key. Use larger chunk sizes (subject to SRAM constraints) to speed up the computation.
+- `query_chunk_size` and `key_chunk_size` are the chunk sizes for the query and key. Choose as large as you can untill out of memory to speed up the computation.
 
 - `policy` is the checkpoint policy for the attention weights, use `jax.checkpoint_policies.nothing_saveable` to enable the checkpointing.
 
