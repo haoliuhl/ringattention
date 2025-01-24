@@ -16,7 +16,7 @@ from ringattention.ringattention_jax import below_or_on_diag
 
 # Handle the arg re-order
 class PatchBlockSpec(pl.BlockSpec):
-    def __init__(index_map, block_shape):
+    def __init__(self, index_map, block_shape):
         super().__init__(block_shape=block_shape, index_map=index_map)
 
 
